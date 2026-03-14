@@ -1,0 +1,11 @@
+# Секреты и данные — не пушить
+steam.json
+cookies.json
+processed_trades.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
