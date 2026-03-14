@@ -7,7 +7,7 @@
     
 2.  **Выполните команду:**
        
-    `git clone https://github.com/gradinazz/CSFloat-Auto-Trade.git` 
+    `git clone https://github.com/bca1456/CSFloat-Auto-Trade.git` 
             
 3.  **Перейдите в директорию проекта:**
            
@@ -49,7 +49,7 @@
     
 1.  **Выполните команду:**
       
-    `python CSFloat-Auto-Trade.py` 
+    `python CSFloat_Auto_Trade.py` 
       
 2.  **Скрипт начнёт выполнение и будет проверять наличие новых торговых предложений каждые 5 минут (по умолчанию).**
     
