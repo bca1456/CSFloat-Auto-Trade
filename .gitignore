@@ -2,6 +2,7 @@
 steam.json
 cookies.json
 processed_trades.json
+incoming_trades_log.json
 
 # Python
 __pycache__/

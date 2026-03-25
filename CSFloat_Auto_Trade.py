@@ -2,6 +2,7 @@ import asyncio
 import json
 import aiohttp
 from pathlib import Path
+from datetime import datetime
 from aiosteampy import SteamClient, AppContext
 from aiosteampy.utils import get_jsonable_cookies
 from aiosteampy.helpers import restore_from_cookies
@@ -39,6 +40,8 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 # Path to store processed trade IDs
 PROCESSED_TRADES_FILE = Path("processed_trades.json")
 
+INCOMING_TRADES_LOG_FILE = Path("incoming_trades_log.json")
+
 def load_steam_config(config_path='steam.json'):
     with open(config_path, 'r') as file:
         return json.load(file)
@@ -56,6 +59,26 @@ def load_processed_trades():
 def save_processed_trades(processed_trades):
     with PROCESSED_TRADES_FILE.open("w") as f:
         json.dump(list(processed_trades), f, indent=2)
+
+def load_incoming_trades_log():
+    """
+    Лог принятых входящих Steam-трейдов (когда нам отправляют скин, а с нашей стороны ничего).
+    Храним список записей, а для дедупликации используем offer_id.
+    """
+    if INCOMING_TRADES_LOG_FILE.is_file():
+        with INCOMING_TRADES_LOG_FILE.open("r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+            except json.JSONDecodeError:
+                return []
+    return []
+
+def append_incoming_trade_log(entry: dict):
+    log = load_incoming_trades_log()
+    log.append(entry)
+    with INCOMING_TRADES_LOG_FILE.open("w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
 
 async def get_user_info(session, csfloat_api_key):
     headers = {'Authorization': csfloat_api_key}
@@ -110,6 +133,58 @@ async def accept_trade(session, csfloat_api_key, trade_id, trade_token):
 # Количество попыток при ошибке 500 (Steam иногда возвращает Internal Server Error)
 SEND_TRADE_MAX_RETRIES = 3
 SEND_TRADE_RETRY_DELAY_SEC = 10
+
+async def check_incoming_trade_offers(client: SteamGuardMixin):
+    """
+    Ищет входящие Steam-трейдофферы (received), где мы ничего не отдаём, но получаем предмет(ы),
+    принимает их и пишет в отдельный лог: дата принятия + названия скинов.
+    """
+    try:
+        existing_log = load_incoming_trades_log()
+        processed_offer_ids = {str(e.get("offer_id")) for e in existing_log if isinstance(e, dict)}
+
+        _, received, _ = await client.get_trade_offers(active_only=True, sent=False, received=True)
+
+        for offer in received:
+            offer_id = getattr(offer, "trade_offer_id", None)
+            if offer_id is None:
+                continue
+
+            if str(offer_id) in processed_offer_ids:
+                continue
+
+            items_to_give = getattr(offer, "items_to_give", []) or []
+            items_to_receive = getattr(offer, "items_to_receive", []) or []
+
+            # Принимаем только "входящие подарки": мы ничего не отдаём, но получаем предметы
+            if len(items_to_give) != 0 or len(items_to_receive) == 0:
+                continue
+
+            # Принимаем оффер
+            await client.accept_trade_offer(offer)
+
+            item_names = []
+            for it in items_to_receive:
+                descr = getattr(it, "description", None)
+                if descr is not None:
+                    name = getattr(descr, "market_hash_name", None) or getattr(descr, "market_name", None) or getattr(descr, "name", None)
+                else:
+                    name = None
+                item_names.append(name or str(getattr(it, "asset_id", "unknown")))
+
+            append_incoming_trade_log({
+                "offer_id": int(offer_id),
+                "accepted_at": datetime.now().isoformat(timespec="seconds"),
+                "items": item_names,
+                "partner": getattr(offer, "partner_id64", None) or getattr(offer, "partner_id", None),
+                "message": getattr(offer, "message", ""),
+            })
+
+            processed_offer_ids.add(str(offer_id))
+            print(f"Accepted incoming trade offer {offer_id}: {', '.join(item_names)}")
+
+    except Exception as e:
+        print(f"An error occurred while checking incoming trade offers: {e}")
 
 
 async def send_steam_trade(client: SteamClient, trade_id, buyer_steam_id=None, trade_url=None, asset_id=None, trade_token=None):
@@ -232,6 +307,9 @@ async def confirm_trade(client: SteamGuardMixin):
         print(f"An error occurred while confirming trades: {e}")
 
 async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMixin, shared_secret, identity_secret, processed_trades, check_interval_minutes):
+    # Сначала обрабатываем входящие Steam-трейды (buy order: продавец присылает скин, мы ничего не отдаём).
+    await check_incoming_trade_offers(client)
+
     user_info = await get_user_info(session, csfloat_api_key)
 
     if user_info and user_info.get('actionable_trades', 0) > 0:
