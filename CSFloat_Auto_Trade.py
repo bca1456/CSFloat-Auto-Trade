@@ -345,6 +345,44 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                             continue
 
                         if trade_id and seller_id and buyer_id and asset_id:
+                            my_steam_id64 = int(client.steam_id)
+                            try:
+                                sid = int(seller_id)
+                                bid = int(buyer_id)
+                            except (TypeError, ValueError):
+                                print(f"Trade {trade_id}: некорректные seller_id/buyer_id, пропуск.")
+                                continue
+
+                            # Покупатель на CSFloat: предмет пришлёт продавец в Steam — мы не отправляем оффер из своего инвентаря.
+                            # Входящие Steam-трейды обрабатываются в check_incoming_trade_offers().
+                            if my_steam_id64 == bid and my_steam_id64 != sid:
+                                if not accepted_at:
+                                    print(
+                                        f"Trade {trade_id}: вы покупатель — принимаем сделку на CSFloat; "
+                                        f"в Steam предмет пришлёт продавец (входящий трейд — отдельная проверка)."
+                                    )
+                                    accept_result = await accept_trade(
+                                        session, csfloat_api_key, trade_id=str(trade_id), trade_token=trade_token
+                                    )
+                                    if accept_result:
+                                        processed_trades.add(str(trade_id))
+                                    else:
+                                        print(f"Failed to accept trade {trade_id} (покупатель)")
+                                else:
+                                    print(
+                                        f"Trade {trade_id}: вы покупатель, сделка на CSFloat уже принята — "
+                                        f"отправку в Steam скрипт не выполняет; ждите/примите входящий трейд от продавца."
+                                    )
+                                    processed_trades.add(str(trade_id))
+                                continue
+
+                            if my_steam_id64 != sid:
+                                print(
+                                    f"Trade {trade_id}: ваш Steam ID не совпадает с seller_id (вы не продавец этой сделки), пропуск."
+                                )
+                                continue
+
+                            # Ниже — только роль продавца: принять на CSFloat и отправить предмет покупателю в Steam.
                             send_success = False
                             if accepted_at:
                                 # Предложение уже принято, отправляем торговое предложение
