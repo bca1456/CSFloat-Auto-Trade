@@ -80,6 +80,47 @@ def append_incoming_trade_log(entry: dict):
     with INCOMING_TRADES_LOG_FILE.open("w", encoding="utf-8") as f:
         json.dump(log, f, indent=2, ensure_ascii=False)
 
+
+def _extract_item_name_and_price(trade: dict) -> tuple[str, str]:
+    """
+    Достаёт из ответа CSFloat имя предмета и цену для логов.
+    Цена в API приходит в центах; в лог выводится уже пересчитанная сумма (/ 100).
+    """
+    contract = trade.get("contract", {}) if isinstance(trade, dict) else {}
+    item = contract.get("item", {}) if isinstance(contract, dict) else {}
+
+    item_name = (
+        item.get("market_hash_name")
+        or item.get("name")
+        or item.get("item_name")
+        or trade.get("item_name")
+        or "unknown item"
+    )
+
+    raw_price = (
+        trade.get("price")
+        or trade.get("sale_price")
+        or trade.get("listed_price")
+        or trade.get("total_price")
+        or contract.get("price")
+        or item.get("price")
+    )
+    currency = trade.get("currency") or "USD"
+
+    if raw_price is None:
+        price_text = "unknown price"
+    elif isinstance(raw_price, (int, float)):
+        # CSFloat отдаёт цену в центах (minor units) — всегда делим на 100 для отображения в долларах/единицах валюты.
+        price_text = f"{float(raw_price) / 100:.2f} {currency}"
+    else:
+        try:
+            cents = float(str(raw_price).strip())
+            price_text = f"{cents / 100:.2f} {currency}"
+        except ValueError:
+            price_text = str(raw_price)
+
+    return item_name, price_text
+
 async def get_user_info(session, csfloat_api_key):
     headers = {'Authorization': csfloat_api_key}
     try:
@@ -326,12 +367,12 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
 
                         # Проверка, был ли уже обработан этот trade_id
                         if str(trade_id) in processed_trades:
-                            print(f"Trade {trade_id} has already been processed. Skipping.")
-                            continue  # Пропустить уже обработанные трейды
+                            continue
 
                         seller_id = trade.get('seller_id')  # ID отправителя
                         buyer_id = trade.get('buyer_id')    # ID получателя
                         asset_id = trade.get('contract', {}).get('item', {}).get('asset_id')
+                        item_name, sale_price = _extract_item_name_and_price(trade)
                         trade_token = trade.get('trade_token')  # Получаем trade_token
                         trade_url = trade.get('trade_url')      # Получаем trade_url
                         accepted_at = trade.get('accepted_at')  # Получаем время принятия, если есть
@@ -369,10 +410,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                                     else:
                                         print(f"Failed to accept trade {trade_id} (покупатель)")
                                 else:
-                                    print(
-                                        f"Trade {trade_id}: вы покупатель, сделка на CSFloat уже принята — "
-                                        f"отправку в Steam скрипт не выполняет; ждите/примите входящий трейд от продавца."
-                                    )
+                                    # Покупатель, CSFloat уже принят — в Steam ждём входящий трейд (без шума в логе).
                                     processed_trades.add(str(trade_id))
                                 continue
 
@@ -386,7 +424,9 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                             send_success = False
                             if accepted_at:
                                 # Предложение уже принято, отправляем торговое предложение
-                                print(f"Trade {trade_id} уже принято. Переходим к отправке торгового предложения.")
+                                print(
+                                    f"Trade {trade_id} уже принято. Отправка '{item_name}' за {sale_price}."
+                                )
                                 offer_id = await send_steam_trade(
                                     client,
                                     trade_id=str(trade_id),
@@ -397,16 +437,19 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                                 )
                                 send_success = bool(offer_id)
                                 if offer_id:
+                                    print(
+                                        f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}."
+                                    )
                                     await confirm_trade(client)
                                 else:
                                     print(f"Failed to send trade for {trade_id}")
                             else:
                                 # Предложение ещё не принято, принимаем его
-                                print(f"Accepting trade {trade_id}...")
+                                print(f"Accepting trade {trade_id} ({item_name}, {sale_price})...")
                                 accept_result = await accept_trade(session, csfloat_api_key, trade_id=str(trade_id), trade_token=trade_token)
 
                                 if accept_result:
-                                    print(f"Sending item to buyer for trade {trade_id}...")
+                                    print(f"Sending '{item_name}' to buyer for trade {trade_id} ({sale_price})...")
                                     offer_id = await send_steam_trade(
                                         client,
                                         trade_id=str(trade_id),
@@ -417,6 +460,9 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                                     )
                                     send_success = bool(offer_id)
                                     if offer_id:
+                                        print(
+                                            f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}."
+                                        )
                                         await confirm_trade(client)
                                     else:
                                         print(f"Failed to send trade for {trade_id}")
@@ -429,7 +475,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                                 processed_trades.add(str(trade_id))
                             else:
                                 print(f"Trade {trade_id} не помечен как обработанный — повторная попытка при следующей проверке.")
-                        
+
             else:
                 print(f"Unexpected trades list format: {type(trades_list)}")
         else:
