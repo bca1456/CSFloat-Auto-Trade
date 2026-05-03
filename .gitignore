@@ -1,8 +1,11 @@
 # Секреты и данные — не пушить
 steam.json
+tg.json
 cookies.json
 processed_trades.json
 incoming_trades_log.json
+incoming_trades_ignored.json
+seller_sent_pending_verification.json
 
 # Python
 __pycache__/
