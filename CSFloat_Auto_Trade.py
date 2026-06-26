@@ -8,8 +8,8 @@ from aiosteampy.utils import get_jsonable_cookies
 from aiosteampy.helpers import restore_from_cookies
 from aiosteampy.mixins.guard import SteamGuardMixin  # Импортируем SteamGuard для подтверждения трейдов
 from aiosteampy.mixins.web_api import SteamWebApiMixin  # Импортируем WebApiMixin для работы с Web API
-from aiosteampy.models import ItemDescription
-from aiosteampy.constants import TradeOfferStatus
+from aiosteampy.models import ItemDescription, EconItem, BaseTradeOfferItem
+from aiosteampy.constants import TradeOfferStatus, TRADABLE_AFTER_DATE_FORMAT
 
 # Патч для aiosteampy: у части предметов CS2 ссылка Inspect не содержит "%D",
 # из-за чего _set_d_id() падает с "list index out of range" на split("%D")[1].
@@ -25,6 +25,45 @@ def _patched_set_d_id(self):
         object.__setattr__(self, "d_id", 0)
 
 ItemDescription._set_d_id = _patched_set_d_id
+
+# Патч для aiosteampy: Steam изменил формат даты trade hold в owner_descriptions.
+# Старый: "Jul 2, 2025 (20:00:00) GMT", новый: "2 Jul @ 8:00pm"
+def _parse_tradable_after_date(date_string: str) -> datetime:
+    date_string = date_string.strip().rstrip(".")
+    try:
+        return datetime.strptime(date_string, TRADABLE_AFTER_DATE_FORMAT)
+    except ValueError:
+        pass
+    now = datetime.now()
+    dt = datetime.strptime(f"{date_string} {now.year}", "%d %b @ %I:%M%p %Y")
+    if dt < now:
+        dt = dt.replace(year=now.year + 1)
+    return dt
+
+
+def _patched_set_tradable_after(self):
+    desc = self.description
+    if desc is None or not desc.market_tradable_restriction:
+        return
+    for sep in (
+        "Tradable/Marketable After ",
+        "This item is trade-protected and cannot be consumed, modified, or transferred until ",
+    ):
+        t_a_descr = next(
+            filter(lambda d: sep in d.value, desc.owner_descriptions or ()),
+            None,
+        )
+        if t_a_descr is not None:
+            date_string = t_a_descr.value.split(sep, 1)[1]
+            try:
+                self.tradable_after = _parse_tradable_after_date(date_string)
+            except ValueError:
+                pass
+            return
+
+
+EconItem._set_tradable_after = _patched_set_tradable_after
+BaseTradeOfferItem._set_tradable_after = _patched_set_tradable_after
 
 # Продолжительность ожидания между проверками (в минутах)
 CHECK_INTERVAL_MINUTES = 25
@@ -509,6 +548,15 @@ async def accept_trade(session, csfloat_api_key, trade_id, trade_token):
 SEND_TRADE_MAX_RETRIES = 3
 SEND_TRADE_RETRY_DELAY_SEC = 10
 
+
+def csfloat_steam_offer_message(csfloat_trade_id) -> str:
+    """
+    Комментарий к Steam trade offer, как при создании оффера через UI CSFloat («Trade offer»).
+    Пример: CSFloat Trade Offer Ref #970784598306980771
+    """
+    return f"CSFloat Trade Offer Ref #{csfloat_trade_id}"
+
+
 async def check_incoming_trade_offers(client: SteamGuardMixin):
     """
     Ищет входящие Steam-трейдофферы (received), где мы ничего не отдаём, но получаем предмет(ы),
@@ -621,7 +669,7 @@ async def send_steam_trade(client: SteamClient, trade_id, buyer_steam_id=None, t
                     continue
                 my_inv = inv_result[0] if len(inv_result) > 0 else []
             except (ValueError, IndexError) as e:
-                print(f"Ошибка при разборе инвентаря (list index out of range или unpack): {e}")
+                print(f"Ошибка при загрузке/разборе инвентаря: {e}")
                 last_error = e
                 if attempt < SEND_TRADE_MAX_RETRIES:
                     await asyncio.sleep(SEND_TRADE_RETRY_DELAY_SEC)
@@ -643,13 +691,15 @@ async def send_steam_trade(client: SteamClient, trade_id, buyer_steam_id=None, t
                 print(f"Предмет с asset_id {asset_id} не найден в инвентаре.")
                 return False
 
+            steam_offer_msg = csfloat_steam_offer_message(trade_id)
+
             # Вызов make_trade_offer с использованием Steam ID или Trade URL
             if trade_url:
                 offer_id = await client.make_trade_offer(
                     trade_url,
                     to_give=[item_to_give],
                     to_receive=[],
-                    message=""
+                    message=steam_offer_msg
                 )
             elif buyer_steam_id:
                 if trade_token:
@@ -657,7 +707,7 @@ async def send_steam_trade(client: SteamClient, trade_id, buyer_steam_id=None, t
                         buyer_steam_id,
                         to_give=[item_to_give],
                         to_receive=[],
-                        message="",
+                        message=steam_offer_msg,
                         token=trade_token
                     )
                 else:
@@ -665,7 +715,7 @@ async def send_steam_trade(client: SteamClient, trade_id, buyer_steam_id=None, t
                         buyer_steam_id,
                         to_give=[item_to_give],
                         to_receive=[],
-                        message=""
+                        message=steam_offer_msg
                     )
             else:
                 print("Необходимо указать либо buyer_steam_id, либо trade_url.")
