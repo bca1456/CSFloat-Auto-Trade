@@ -708,13 +708,8 @@ async def check_incoming_trade_offers(client: SteamGuardMixin):
 # =============================================================================
 
 async def confirm_offers_via_asf():
-    """
-    Подтверждает все ожидающие офферы через ArchiSteamFarm API.
-    Возвращает True при успехе, False при ошибке.
-    """
     bot_name = ASF_BOT_NAME
     if not bot_name:
-        # Пытаемся определить бота автоматически
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(
@@ -733,7 +728,6 @@ async def confirm_offers_via_asf():
                 print(f"Ошибка подключения к ASF: {e}")
                 return False
 
-    # Команда: 2faok <SteamLogin>
     cmd = f"2faok {bot_name}"
 
     async with aiohttp.ClientSession() as session:
@@ -745,31 +739,19 @@ async def confirm_offers_via_asf():
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    print(f"ASF ответ: {data}")  # <-- полный вывод ответа
-
-                    # Проверяем успех разными способами
-                    if data.get("success") is True:
+                    # Учитываем оба варианта написания ключа
+                    success = data.get("Success") or data.get("success")
+                    if success is True:
                         print("ASF подтвердил офферы")
                         return True
-
-                    # Иногда ASF возвращает {"Result":"Success"}
-                    if str(data.get("Result", "")).lower() == "success":
-                        print("ASF подтвердил офферы (Result: Success)")
+                    # Если Result содержит "Successfully", тоже считаем успехом
+                    result = data.get("Result", "")
+                    if "successfully" in str(result).lower():
+                        print("ASF подтвердил офферы")
                         return True
-
-                    # Если сообщение содержит намёк на успех
-                    msg = str(data.get("message", "")).lower()
-                    if "success" in msg or "ok" in msg:
-                        print("ASF подтвердил офферы (по сообщению)")
-                        return True
-
-                    # Если вообще нет никаких полей, кроме стандартных, считаем успехом
-                    if not data.get("success") and not data.get("message") and not data.get("Result"):
-                        print("ASF подтвердил офферы (без явного статуса)")
-                        return True
-
-                    # Иначе ошибка
-                    print(f"ASF вернул ошибку: {data.get('message')}")
+                    # Выводим сообщение об ошибке, если есть
+                    err_msg = data.get("Message") or data.get("message")
+                    print(f"ASF вернул ошибку: {err_msg}")
                     return False
                 else:
                     print(f"Ошибка вызова ASF: {resp.status} {await resp.text()}")
