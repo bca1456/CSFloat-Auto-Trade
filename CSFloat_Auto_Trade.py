@@ -1055,6 +1055,8 @@ async def main():
 
     processed_trades = load_processed_trades()
 
+    await send_telegram_notification(f"Auto - Trade bot Started")
+
     async with aiohttp.ClientSession() as session:
         try:
             while True:
