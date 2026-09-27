@@ -93,7 +93,7 @@ USER_AGENT = (
 
 # Настройки отправки Steam-офферов
 STEAM_SEND_COOLDOWN_SEC = 15          # пауза между созданием офферов
-MAX_STEAM_SENDS_PER_PASS = 3          # макс. офферов за один проход
+MAX_STEAM_SENDS_PER_PASS = 15          # макс. офферов за один проход
 STEAM_MOBILECONF_MIN_INTERVAL_SEC = 15 # минимальный интервал между вызовами mobileconf/getlist
 SEND_TRADE_MAX_RETRIES = 1            # попыток при ошибке
 SEND_TRADE_RATE_LIMIT_DELAY_SEC = 300 # пауза при 429
@@ -707,9 +707,16 @@ async def check_incoming_trade_offers(client: SteamGuardMixin):
 # ПОДТВЕРЖДЕНИЕ ОФФЕРОВ ЧЕРЕЗ ASF IPC
 # =============================================================================
 
-async def confirm_offers_via_asf():
+import re
+
+async def confirm_offers_via_asf(expected_count=None, max_retries=3, retry_delay=30):
+    """
+    Подтверждает офферы через ASF с повторами при 0 подтверждений или ошибках.
+    expected_count — сколько офферов мы хотим подтвердить (для проверки результата).
+    """
     bot_name = ASF_BOT_NAME
     if not bot_name:
+        # автоопределение бота (как раньше)
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(
@@ -730,35 +737,66 @@ async def confirm_offers_via_asf():
 
     cmd = f"2faok {bot_name}"
 
-    async with aiohttp.ClientSession() as session:
+    for attempt in range(1, max_retries + 1):
         try:
-            async with session.post(
-                f"{ASF_API_URL}/Api/Command",
-                json={"Command": cmd, "Bot": bot_name},
-                headers={"Authentication": ASF_PASSWORD}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # Учитываем оба варианта написания ключа
-                    success = data.get("Success") or data.get("success")
-                    if success is True:
-                        print("ASF подтвердил офферы")
-                        return True
-                    # Если Result содержит "Successfully", тоже считаем успехом
-                    result = data.get("Result", "")
-                    if "successfully" in str(result).lower():
-                        print("ASF подтвердил офферы")
-                        return True
-                    # Выводим сообщение об ошибке, если есть
-                    err_msg = data.get("Message") or data.get("message")
-                    print(f"ASF вернул ошибку: {err_msg}")
-                    return False
-                else:
-                    print(f"Ошибка вызова ASF: {resp.status} {await resp.text()}")
-                    return False
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{ASF_API_URL}/Api/Command",
+                    json={"Command": cmd, "Bot": bot_name},
+                    headers={"Authentication": ASF_PASSWORD}
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        success = data.get("Success") or data.get("success")
+                        result = data.get("Result", "")
+
+                        if success:
+                            # Парсим количество подтверждённых офферов
+                            match = re.search(r'Successfully handled (\d+) confirmations', result)
+                            handled = int(match.group(1)) if match else 0
+
+                            if expected_count and handled >= expected_count:
+                                print(f"ASF подтвердил {handled} офферов (ожидалось {expected_count})")
+                                return True
+                            elif handled > 0:
+                                print(f"ASF подтвердил {handled} офферов")
+                                return True
+                            else:
+                                print(f"ASF обработал 0 подтверждений (попытка {attempt}/{max_retries})")
+                                if attempt < max_retries:
+                                    print(f"Повтор через {retry_delay} сек...")
+                                    await asyncio.sleep(retry_delay)
+                                    continue
+                                else:
+                                    print("Исчерпаны попытки подтверждения")
+                                    return False
+                        else:
+                            err_msg = data.get("Message") or data.get("message") or "неизвестная ошибка"
+                            print(f"ASF вернул неуспех: {err_msg} (попытка {attempt}/{max_retries})")
+                            if attempt < max_retries:
+                                await asyncio.sleep(retry_delay)
+                                continue
+                            return False
+                    elif resp.status == 429:
+                        print(f"ASF API 429 (попытка {attempt}/{max_retries})")
+                        if attempt < max_retries:
+                            await asyncio.sleep(retry_delay * 2)  # при 429 ждём дольше
+                            continue
+                        return False
+                    else:
+                        print(f"Ошибка ASF: {resp.status} (попытка {attempt}/{max_retries})")
+                        if attempt < max_retries:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return False
         except Exception as e:
-            print(f"Ошибка отправки команды в ASF: {e}")
+            print(f"Ошибка подключения к ASF: {e} (попытка {attempt}/{max_retries})")
+            if attempt < max_retries:
+                await asyncio.sleep(retry_delay)
+                continue
             return False
+
+    return False
 
 
 # =============================================================================
@@ -946,7 +984,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
             print(f"Trade {trade_id} не помечен как обработанный — повторная попытка при следующей проверке.")
             stats["failed"] += 1
 
-    # ПОДТВЕРЖДЕНИЕ ЧЕРЕЗ ASF — собираем свежие + «зависшие»
+        # ПОДТВЕРЖДЕНИЕ ЧЕРЕЗ ASF — собираем свежие + «зависшие»
     pending_all = load_seller_pending_verification_log()
     for entry in pending_all:
         if entry.get("steam_offer_status") == "CONFIRMATION_NEED" and entry.get("steam_offer_id"):
@@ -956,9 +994,9 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
 
     if offers_to_confirm:
         print(f"\nПодтверждаем {len(offers_to_confirm)} офферов через ASF...")
-        success = await confirm_offers_via_asf()
+        success = await confirm_offers_via_asf(expected_count=len(offers_to_confirm))
         if success:
-            # Обновляем статусы в логе для всех подтверждённых
+            # Обновляем статусы
             for oid in offers_to_confirm:
                 for entry in pending_all:
                     if entry.get("steam_offer_id") == oid:
@@ -968,7 +1006,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                         upsert_seller_pending_verification(entry)
                         break
         else:
-            print("Не удалось подтвердить офферы через ASF – они будут повторно отправлены в следующем цикле")
+            print("Не удалось подтвердить офферы через ASF – будут повторные попытки в следующем цикле")
 
     print(
         f"Trade pass summary: total={stats['total']}, sent={stats['seller_sent']}, "
