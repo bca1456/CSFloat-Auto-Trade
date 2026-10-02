@@ -648,7 +648,7 @@ async def confirm_offers_via_asf(expected_count=None, max_retries=3, retry_delay
                     if not (data.get("Success") or data.get("success")):
                         raise RuntimeError(data.get("Message") or data.get("message") or "ASF command failed")
                     result = data.get("Result", "")
-                    match = re.search(r"Successfully handled (\d+) confirmations", result)
+                    match = re.search(r"Successfully handled (\d+) confirmations", str(result))
                     handled = int(match.group(1)) if match else 0
                     if handled > 0:
                         print(f"ASF confirmed {handled} offer(s)")
@@ -836,6 +836,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
             stats["failed"] += 1
 
     pending_all = load_seller_pending_verification_log()
+    offers_to_confirm = []
     for entry in pending_all:
         if entry.get("steam_offer_status") == "CONFIRMATION_NEED" and entry.get("steam_offer_id"):
             oid = entry["steam_offer_id"]
@@ -905,8 +906,11 @@ async def main():
     async with aiohttp.ClientSession() as session:
         try:
             while True:
-                await check_actionable_trades(session, csfloat_api_key, client, processed_trades)
-                save_processed_trades(processed_trades)
+                try:
+                    await check_actionable_trades(session, csfloat_api_key, client, processed_trades)
+                    save_processed_trades(processed_trades)
+                except Exception as e:
+                    print(f"Trade pass failed; bot will retry after {CHECK_INTERVAL_MINUTES} min: {e}")
                 await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
         finally:
             with COOKIE_FILE.open("w") as f:
