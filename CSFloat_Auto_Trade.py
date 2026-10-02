@@ -77,12 +77,9 @@ CHECK_INTERVAL_MINUTES = 25
 
 API_USER_INFO = "https://csfloat.com/api/v1/me"
 API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"
-API_ACCEPT_TRADE = "https://csfloat.com/api/v1/trades/{trade_id}/accept"
 
 COOKIE_FILE = Path("cookies.json")
 PROCESSED_TRADES_FILE = Path("processed_trades.json")
-INCOMING_TRADES_LOG_FILE = Path("incoming_trades_log.json")
-INCOMING_TRADES_IGNORED_FILE = Path("incoming_trades_ignored.json")
 SELLER_PENDING_VERIFICATION_LOG_FILE = Path("seller_sent_pending_verification.json")
 TG_CONFIG_FILE = Path("tg.json")
 
@@ -188,50 +185,6 @@ def load_processed_trades():
 def save_processed_trades(processed_trades):
     with PROCESSED_TRADES_FILE.open("w") as f:
         json.dump(list(processed_trades), f, indent=2)
-
-
-def load_incoming_trades_log():
-    if INCOMING_TRADES_LOG_FILE.is_file():
-        with INCOMING_TRADES_LOG_FILE.open("r", encoding="utf-8") as f:
-            try:
-                data = json.load(f)
-                return data if isinstance(data, list) else []
-            except json.JSONDecodeError:
-                return []
-    return []
-
-
-def append_incoming_trade_log(entry: dict):
-    log = load_incoming_trades_log()
-    log.append(entry)
-    with INCOMING_TRADES_LOG_FILE.open("w", encoding="utf-8") as f:
-        json.dump(log, f, indent=2, ensure_ascii=False)
-
-
-def load_incoming_trades_ignored():
-    if INCOMING_TRADES_IGNORED_FILE.is_file():
-        with INCOMING_TRADES_IGNORED_FILE.open("r", encoding="utf-8") as f:
-            try:
-                data = json.load(f)
-                return data if isinstance(data, list) else []
-            except json.JSONDecodeError:
-                return []
-    return []
-
-
-def append_incoming_trade_ignored(entry: dict):
-    data = load_incoming_trades_ignored()
-    offer_id = str(entry.get("offer_id"))
-    updated = False
-    for i, old in enumerate(data):
-        if str(old.get("offer_id")) == offer_id:
-            data[i] = {**old, **entry}
-            updated = True
-            break
-    if not updated:
-        data.append(entry)
-    with INCOMING_TRADES_IGNORED_FILE.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def load_seller_pending_verification_log():
@@ -483,22 +436,6 @@ async def get_trades(session, csfloat_api_key):
     return None
 
 
-async def accept_trade(session, csfloat_api_key, trade_id, trade_token):
-    url = API_ACCEPT_TRADE.format(trade_id=trade_id)
-    headers = {'Authorization': csfloat_api_key, 'Content-Type': 'application/json'}
-    payload = {'trade_token': trade_token}
-    try:
-        async with session.post(url, headers=headers, json=payload) as response:
-            if response.status != 200:
-                detail = await response.text()
-                print(f"CSFloat accept failed {trade_id}: {response.status} {detail}")
-                return False
-            return True
-    except Exception as e:
-        print(f"CSFloat accept error {trade_id}: {e}")
-    return False
-
-
 # =============================================================================
 # STEAM TRADE OFFER — ОТПРАВКА (БЕЗ ПОДТВЕРЖДЕНИЯ)
 # =============================================================================
@@ -636,74 +573,6 @@ async def send_steam_trade_limited(client: SteamClient, *, sends_this_pass: int,
 
 
 # =============================================================================
-# ОБРАБОТКА ВХОДЯЩИХ STEAM-ОФФЕРОВ (BUY ORDERS)
-# =============================================================================
-
-async def check_incoming_trade_offers(client: SteamGuardMixin):
-    try:
-        existing_log = load_incoming_trades_log()
-        ignored_log = load_incoming_trades_ignored()
-        processed_ids = {str(e.get("offer_id")) for e in existing_log if isinstance(e, dict)}
-        processed_ids.update(str(e.get("offer_id")) for e in ignored_log if isinstance(e, dict))
-        _, received, _ = await client.get_trade_offers(active_only=True, sent=False, received=True)
-    except Exception as e:
-        print(f"Incoming check error: {e}")
-        return
-
-    for offer in received:
-        offer_id = getattr(offer, "trade_offer_id", None)
-        if offer_id is None or str(offer_id) in processed_ids:
-            continue
-        items_to_give = getattr(offer, "items_to_give", []) or []
-        items_to_receive = getattr(offer, "items_to_receive", []) or []
-        if len(items_to_give) != 0 or len(items_to_receive) == 0:
-            continue
-
-        accepted = False
-        for attempt in range(1, 4):
-            try:
-                await client.accept_trade_offer(offer)
-                accepted = True
-                break
-            except aiohttp.ClientResponseError as http_err:
-                if http_err.status == 500 and attempt < 3:
-                    await asyncio.sleep(5)
-                    continue
-                print(f"Failed to accept incoming offer {offer_id}: {http_err}")
-                break
-            except Exception as e:
-                print(f"Failed to accept incoming offer {offer_id}: {e}")
-                break
-
-        if not accepted:
-            try:
-                fetched = await client.get_trade_offer(int(offer_id))
-                if fetched.status in {TradeOfferStatus.CANCELED, TradeOfferStatus.DECLINED, TradeOfferStatus.EXPIRED, TradeOfferStatus.INVALID, TradeOfferStatus.INVALID_ITEMS, TradeOfferStatus.CANCELED_BY_SECONDARY_FACTOR, TradeOfferStatus.TRADE_REVERSED}:
-                    append_incoming_trade_ignored({"offer_id": int(offer_id), "status": fetched.status.name, "updated_at": datetime.now().isoformat(timespec="seconds"), "note": "Offer no longer active"})
-                    processed_ids.add(str(offer_id))
-            except Exception:
-                pass
-            continue
-
-        item_names = []
-        for it in items_to_receive:
-            descr = getattr(it, "description", None)
-            name = getattr(descr, "market_hash_name", None) or getattr(descr, "market_name", None) or getattr(descr, "name", None) if descr else None
-            item_names.append(name or str(getattr(it, "asset_id", "unknown")))
-
-        append_incoming_trade_log({
-            "offer_id": int(offer_id),
-            "accepted_at": datetime.now().isoformat(timespec="seconds"),
-            "items": item_names,
-            "partner": getattr(offer, "partner_id64", None) or getattr(offer, "partner_id", None),
-            "message": getattr(offer, "message", ""),
-        })
-        processed_ids.add(str(offer_id))
-        print(f"Accepted incoming trade offer {offer_id}: {', '.join(item_names)}")
-        await send_telegram_notification(f"Accepted incoming Steam trade offer {offer_id}\nItems: {', '.join(item_names)}")
-
-
-# =============================================================================
 # ПОДТВЕРЖДЕНИЕ ОФФЕРОВ ЧЕРЕЗ ASF IPC
 # =============================================================================
 
@@ -804,7 +673,6 @@ async def confirm_offers_via_asf(expected_count=None, max_retries=3, retry_delay
 # =============================================================================
 
 async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMixin, processed_trades):
-    await check_incoming_trade_offers(client)
     await refresh_all_seller_pending_verification_from_steam(client)
 
     user_info = await get_user_info(session, csfloat_api_key)
@@ -823,7 +691,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
     seller_pending_by_id = load_seller_pending_by_trade_id()
     seller_pending_csfloat_ids = set(seller_pending_by_id.keys())
 
-    stats = {"total": 0, "seller_sent": 0, "seller_waiting_verified": 0, "buyer_waiting_incoming": 0, "failed": 0, "deferred": 0, "skipped_429": 0}
+    stats = {"total": 0, "seller_sent": 0, "seller_waiting_verified": 0, "failed": 0, "deferred": 0, "skipped_429": 0}
     sends_this_pass = 0
     consecutive_429_errors = 0
     my_steam_id64 = int(client.steam_id)
@@ -845,7 +713,6 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
         item_name, sale_price = _extract_item_name_and_price(trade)
         trade_token = trade.get('trade_token')
         trade_url = trade.get('trade_url')
-        accepted_at = trade.get('accepted_at')
         trade_state = trade.get('state')
 
         if trade_state == "verified":
@@ -877,7 +744,6 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
 
         if my_steam_id64 == bid and my_steam_id64 != sid:
             processed_trades.add(str(trade_id))
-            stats["buyer_waiting_incoming"] += 1
             continue
 
         if my_steam_id64 != sid:
@@ -887,87 +753,57 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
         send_success = False
         sent_offer_id = None
 
-        if accepted_at:
-            try:
-                existing_offer_id, existing_offer_status = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id))
-            except Exception:
-                existing_offer_id, existing_offer_status = None, None
+        if trade_state != "accepted":
+            continue
 
-            if existing_offer_id:
-                send_success = True
-                sent_offer_id = int(existing_offer_id)
-                upsert_seller_pending_verification({
-                    "trade_id": str(trade_id), "item_name": item_name, "sale_price": sale_price,
-                    "asset_id": str(asset_id), "buyer_id": str(buyer_id),
-                    "steam_offer_id": int(existing_offer_id),
-                    "csfloat_state": trade_state or "unknown",
-                    "steam_offer_status": existing_offer_status.name,
-                    "last_checked_at": datetime.now().isoformat(timespec="seconds"),
-                    "note": "Оффер уже отправлялся ранее; ждём verified на CSFloat",
-                })
-            else:
-                print(f"Trade {trade_id} уже принято. Отправка '{item_name}' за {sale_price}.")
-                try:
-                    offer_id, sends_this_pass, deferred = await send_steam_trade_limited(
-                        client, sends_this_pass=sends_this_pass,
-                        trade_id=str(trade_id), buyer_steam_id=bid,
-                        asset_id=int(asset_id), trade_token=trade_token, trade_url=trade_url
-                    )
-                except aiohttp.ClientResponseError as e:
-                    if e.status == 429:
-                        consecutive_429_errors += 1
-                    continue
+        try:
+            existing_offer_id, existing_offer_status = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id))
+        except Exception:
+            existing_offer_id, existing_offer_status = None, None
 
-                if deferred:
-                    stats["deferred"] += 1
-                    continue
-
-                if offer_id:
-                    send_success = True
-                    sent_offer_id = int(offer_id)
-                    offers_to_confirm.append(sent_offer_id)
-                    print(f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}.")
-                    await send_telegram_notification(f"CSFloat sale sent\nTrade: {trade_id}\nItem: {item_name}\nPrice: {sale_price}")
-                else:
-                    try:
-                        existing_offer_id, _ = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id))
-                    except Exception:
-                        existing_offer_id = None
-                    if existing_offer_id:
-                        send_success = True
-                        sent_offer_id = int(existing_offer_id)
+        if existing_offer_id:
+            send_success = True
+            sent_offer_id = int(existing_offer_id)
+            upsert_seller_pending_verification({
+                "trade_id": str(trade_id), "item_name": item_name, "sale_price": sale_price,
+                "asset_id": str(asset_id), "buyer_id": str(buyer_id),
+                "steam_offer_id": int(existing_offer_id),
+                "csfloat_state": trade_state or "unknown",
+                "steam_offer_status": existing_offer_status.name,
+                "last_checked_at": datetime.now().isoformat(timespec="seconds"),
+                "note": "Оффер уже отправлялся ранее; ждём verified на CSFloat",
+            })
         else:
-            print(f"Accepting trade {trade_id} ({item_name}, {sale_price})...")
-            accept_result = await accept_trade(session, csfloat_api_key, trade_id=str(trade_id), trade_token=trade_token)
-            if accept_result:
-                print(f"Sending '{item_name}' to buyer for trade {trade_id} ({sale_price})...")
-                try:
-                    offer_id, sends_this_pass, deferred = await send_steam_trade_limited(
-                        client, sends_this_pass=sends_this_pass,
-                        trade_id=str(trade_id), buyer_steam_id=bid,
-                        asset_id=int(asset_id), trade_token=trade_token, trade_url=trade_url
-                    )
-                except aiohttp.ClientResponseError as e:
-                    if e.status == 429:
-                        consecutive_429_errors += 1
-                    continue
+            print(f"Trade {trade_id} уже принято. Отправка '{item_name}' за {sale_price}.")
+            try:
+                offer_id, sends_this_pass, deferred = await send_steam_trade_limited(
+                    client, sends_this_pass=sends_this_pass,
+                    trade_id=str(trade_id), buyer_steam_id=bid,
+                    asset_id=int(asset_id), trade_token=trade_token, trade_url=trade_url
+                )
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:
+                    consecutive_429_errors += 1
+                continue
 
-                if deferred:
-                    stats["deferred"] += 1
-                    continue
+            if deferred:
+                stats["deferred"] += 1
+                continue
 
-                if offer_id:
-                    send_success = True
-                    sent_offer_id = int(offer_id)
-                    offers_to_confirm.append(sent_offer_id)
-                    print(f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}.")
-                    await send_telegram_notification(f"CSFloat sale sent\nTrade: {trade_id}\nItem: {item_name}\nPrice: {sale_price}")
-                else:
-                    print(f"Failed to send trade for {trade_id}")
+            if offer_id:
+                send_success = True
+                sent_offer_id = int(offer_id)
+                offers_to_confirm.append(sent_offer_id)
+                print(f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}.")
+                await send_telegram_notification(f"CSFloat sale sent\nTrade: {trade_id}\nItem: {item_name}\nPrice: {sale_price}")
             else:
-                print(f"Failed to accept trade {trade_id}")
-                stats["failed"] += 1
-
+                try:
+                    existing_offer_id, _ = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id))
+                except Exception:
+                    existing_offer_id = None
+                if existing_offer_id:
+                    send_success = True
+                    sent_offer_id = int(existing_offer_id)
         if send_success:
             processed_trades.add(str(trade_id))
             stats["seller_sent"] += 1
@@ -1011,7 +847,6 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
     print(
         f"Trade pass summary: total={stats['total']}, sent={stats['seller_sent']}, "
         f"waiting_verified={stats['seller_waiting_verified']}, "
-        f"buyer_waiting_incoming={stats['buyer_waiting_incoming']}, "
         f"deferred={stats['deferred']}, skipped_429={stats['skipped_429']}, "
         f"failed={stats['failed']}"
     )
