@@ -74,7 +74,7 @@ BaseTradeOfferItem._set_tradable_after = _patched_set_tradable_after
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # =============================================================================
 
-CHECK_INTERVAL_MINUTES = 25
+CHECK_INTERVAL_MINUTES = 30
 STEAM_API_MIN_INTERVAL_SEC = 3
 STEAM_RATE_LIMIT_BACKOFF_SEC = 15 * 60
 SELLER_SYNC_INTERVAL_SEC = 6 * 60 * 60
