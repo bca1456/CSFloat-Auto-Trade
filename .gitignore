@@ -8,6 +8,7 @@ incoming_trades_log.json
 incoming_trades_ignored.json
 seller_sent_pending_verification.json
 buyer_purchases_log.json
+steam_rate_limit.json
 
 # Python
 __pycache__/
