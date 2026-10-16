@@ -1,11 +1,15 @@
 import asyncio
 import json
+import logging
 import os
+import random
 import re
+import sys
 import time
 import aiohttp
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, parse_qs
 
 from aiosteampy import SteamClient, AppContext
@@ -21,6 +25,43 @@ from aiosteampy.exceptions import SessionExpired
 class SteamRateLimited(RuntimeError):
     """Steam ограничил запросы (HTTP 429) или действует пауза после лимита."""
 
+
+# =============================================================================
+# ЛОГИРОВАНИЕ И ХЕЛПЕРЫ
+# =============================================================================
+
+LOG_FILE = Path("csfloat_auto_trade.log")
+
+
+def setup_logging():
+    if logging.getLogger().handlers:
+        return
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+
+def with_jitter(seconds: float, ratio: float = 0.2) -> float:
+    """Разброс вокруг базовой задержки, чтобы не долбить Steam ровным ритмом."""
+    if seconds <= 0:
+        return 0.0
+    return seconds * random.uniform(1 - ratio, 1 + ratio)
+
 # =============================================================================
 # ПАТЧИ ДЛЯ AIOSTEAMPY (фикс парсинга дат и inspect-ссылок)
 # =============================================================================
@@ -35,8 +76,6 @@ def _patched_set_d_id(self):
                 object.__setattr__(self, "d_id", 0)
     except (IndexError, ValueError):
         object.__setattr__(self, "d_id", 0)
-
-ItemDescription._set_d_id = _patched_set_d_id
 
 
 def _parse_tradable_after_date(date_string: str) -> datetime:
@@ -73,8 +112,24 @@ def _patched_set_tradable_after(self):
             return
 
 
-EconItem._set_tradable_after = _patched_set_tradable_after
-BaseTradeOfferItem._set_tradable_after = _patched_set_tradable_after
+def apply_aiosteampy_patches():
+    """Навешивает патчи на aiosteampy, но не падает, если внутренности библиотеки изменились."""
+    patched = []
+    if hasattr(ItemDescription, "_set_d_id"):
+        ItemDescription._set_d_id = _patched_set_d_id
+        patched.append("ItemDescription._set_d_id")
+    else:
+        logger.warning("aiosteampy patch skipped: ItemDescription._set_d_id not found (library changed?)")
+    for cls in (EconItem, BaseTradeOfferItem):
+        if hasattr(cls, "_set_tradable_after"):
+            cls._set_tradable_after = _patched_set_tradable_after
+            patched.append(f"{cls.__name__}._set_tradable_after")
+        else:
+            logger.warning(f"aiosteampy patch skipped: {cls.__name__}._set_tradable_after not found (library changed?)")
+    logger.info(f"aiosteampy patches applied: {', '.join(patched) if patched else 'none'}")
+
+
+apply_aiosteampy_patches()
 
 # =============================================================================
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
@@ -85,6 +140,9 @@ STEAM_API_MIN_INTERVAL_SEC = 3
 STEAM_RATE_LIMIT_BACKOFF_SEC = 15 * 60
 SELLER_SYNC_INTERVAL_SEC = 6 * 60 * 60
 SELLER_SYNC_BATCH_SIZE = 5
+SELLER_SYNC_TRANSIENT_RETRY_SEC = 15 * 60      # повтор проверки pending при транзиентной ошибке
+SELLER_SYNC_ERROR_RETRY_SEC = 12 * 60 * 60     # повтор при постоянной (нетранзиентной) ошибке
+PROCESSED_TRADES_TTL_DAYS = 30                 # сколько хранить обработанные трейды
 
 API_USER_INFO = "https://csfloat.com/api/v1/me"
 API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"
@@ -148,7 +206,7 @@ async def steam_api_call(awaitable_factory, *, client=None):
                 raise RuntimeError(f"Steam auth cooldown active for {int(_steam_auth_backoff_until - now)}s")
             wait_for = STEAM_API_MIN_INTERVAL_SEC - (now - _steam_last_api_call)
             if wait_for > 0:
-                await asyncio.sleep(wait_for)
+                await asyncio.sleep(wait_for + random.uniform(0, 1.0))
             try:
                 result = await awaitable_factory()
             except Exception as exc:
@@ -167,15 +225,17 @@ async def steam_api_call(awaitable_factory, *, client=None):
 
 def _set_steam_backoff():
     global _steam_backoff_until
-    _steam_backoff_until = max(_steam_backoff_until, time.monotonic() + STEAM_RATE_LIMIT_BACKOFF_SEC)
-    until = datetime.fromtimestamp(time.time() + STEAM_RATE_LIMIT_BACKOFF_SEC).isoformat(timespec="seconds")
+    backoff = with_jitter(STEAM_RATE_LIMIT_BACKOFF_SEC, 0.15)
+    _steam_backoff_until = max(_steam_backoff_until, time.monotonic() + backoff)
+    until = datetime.fromtimestamp(time.time() + backoff).isoformat(timespec="seconds")
     _atomic_write_json(STEAM_BACKOFF_FILE, {"until": until})
 
 
 def _set_steam_auth_backoff():
     global _steam_auth_backoff_until
-    _steam_auth_backoff_until = max(_steam_auth_backoff_until, time.monotonic() + STEAM_AUTH_BACKOFF_SEC)
-    until = datetime.fromtimestamp(time.time() + STEAM_AUTH_BACKOFF_SEC).isoformat(timespec="seconds")
+    backoff = with_jitter(STEAM_AUTH_BACKOFF_SEC, 0.15)
+    _steam_auth_backoff_until = max(_steam_auth_backoff_until, time.monotonic() + backoff)
+    until = datetime.fromtimestamp(time.time() + backoff).isoformat(timespec="seconds")
     try:
         _atomic_write_json(STEAM_AUTH_BACKOFF_FILE, {"until": until})
     except OSError:
@@ -200,11 +260,19 @@ def _is_auth_error(exc: Exception) -> bool:
     return "401" in error_text and "unauthorized" in error_text
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    """Транзиентные ошибки (лимиты/паузы), которые не должны блокировать проверку надолго."""
+    if isinstance(exc, SteamRateLimited):
+        return True
+    error_text = str(exc).lower()
+    return any(token in error_text for token in ("cooldown", "rate limit", "429", "timeout", "temporarily"))
+
+
 def _save_steam_cookies(client):
     try:
         _atomic_write_json(COOKIE_FILE, get_jsonable_cookies(client.session))
     except Exception as e:
-        print(f"Failed to persist Steam cookies: {e}")
+        logger.warning(f"Failed to persist Steam cookies: {e}")
 
 
 async def _reauthenticate(client) -> bool:
@@ -214,7 +282,7 @@ async def _reauthenticate(client) -> bool:
         await client.login(init_session=False)
     except Exception as e:
         _steam_auth_failures += 1
-        print(f"Steam re-login failed ({_steam_auth_failures}/{MAX_STEAM_AUTH_FAILURES}): {e}")
+        logger.warning(f"Steam re-login failed ({_steam_auth_failures}/{MAX_STEAM_AUTH_FAILURES}): {e}")
         if _steam_auth_failures >= MAX_STEAM_AUTH_FAILURES:
             _set_steam_auth_backoff()
             await send_telegram_notification(
@@ -225,7 +293,7 @@ async def _reauthenticate(client) -> bool:
     _steam_auth_failures = 0
     _clear_steam_auth_backoff()
     _save_steam_cookies(client)
-    print("Steam session re-authenticated successfully.")
+    logger.info("Steam session re-authenticated successfully.")
     return True
 
 # ==================== НАСТРОЙКИ ASF IPC (загружаются из asf.json) ====================
@@ -234,14 +302,14 @@ def load_asf_config():
     """Загружает параметры ASF IPC из файла asf.json."""
     config_path = Path("asf.json")
     if not config_path.is_file():
-        print("asf.json не найден. ASF-подтверждение будет недоступно.")
+        logger.warning("asf.json не найден. ASF-подтверждение будет недоступно.")
         return None
     try:
         with config_path.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
         return cfg
     except Exception as e:
-        print(f"Ошибка чтения asf.json: {e}")
+        logger.warning(f"Ошибка чтения asf.json: {e}")
         return None
 
 _asf_cfg = load_asf_config()
@@ -293,11 +361,11 @@ async def send_telegram_notification(text: str):
                     if resp.status == 200:
                         return
                     if resp.status in (429, 500, 502, 503, 504) and attempt < 3:
-                        await asyncio.sleep(2 * attempt)
+                        await asyncio.sleep(with_jitter(2 * attempt))
                         continue
         except Exception:
             if attempt < 3:
-                await asyncio.sleep(2 * attempt)
+                await asyncio.sleep(with_jitter(2 * attempt))
                 continue
 
 
@@ -311,18 +379,41 @@ def _atomic_write_json(path: Path, data, *, ensure_ascii: bool = True):
     os.replace(tmp_path, path)
 
 
-def load_processed_trades():
+def load_processed_trades() -> dict:
     if PROCESSED_TRADES_FILE.is_file():
         with PROCESSED_TRADES_FILE.open("r", encoding="utf-8") as f:
             try:
-                return set(json.load(f))
+                data = json.load(f)
             except json.JSONDecodeError:
-                return set()
-    return set()
+                return {}
+        if isinstance(data, dict):
+            return {str(k): v for k, v in data.items()}
+        if isinstance(data, list):  # миграция со старого формата (без таймстемпов)
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            return {str(k): now_iso for k in data}
+    return {}
 
 
-def save_processed_trades(processed_trades):
-    _atomic_write_json(PROCESSED_TRADES_FILE, list(processed_trades))
+def save_processed_trades(processed_trades: dict):
+    """Убирает из памяти/файла трейды старше PROCESSED_TRADES_TTL_DAYS."""
+    cutoff = datetime.now() - timedelta(days=PROCESSED_TRADES_TTL_DAYS)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    pruned = {}
+    for trade_id, ts in processed_trades.items():
+        try:
+            if datetime.fromisoformat(ts) >= cutoff:
+                pruned[trade_id] = ts
+                continue
+        except (TypeError, ValueError):
+            pass
+        pruned[trade_id] = now_iso
+    processed_trades.clear()
+    processed_trades.update(pruned)
+    _atomic_write_json(PROCESSED_TRADES_FILE, pruned)
+
+
+def _mark_processed(processed_trades: dict, trade_id):
+    processed_trades[str(trade_id)] = datetime.now().isoformat(timespec="seconds")
 
 
 def load_seller_pending_verification_log():
@@ -483,7 +574,9 @@ async def refresh_all_seller_pending_verification_from_steam(client: SteamClient
             last_checked = None
         retry_after = 30 * 60 if entry.get("steam_offer_id") else SELLER_SYNC_INTERVAL_SEC
         if entry.get("sync_error"):
-            retry_after = 12 * 60 * 60
+            retry_after = (SELLER_SYNC_TRANSIENT_RETRY_SEC
+                           if entry.get("sync_error_transient")
+                           else SELLER_SYNC_ERROR_RETRY_SEC)
         if last_checked is None or (now - last_checked).total_seconds() >= retry_after:
             due_entries.append(entry)
 
@@ -495,8 +588,13 @@ async def refresh_all_seller_pending_verification_from_steam(client: SteamClient
                 client, _synthetic_trade_from_pending_entry(entry), entry, cache
             )
         except Exception as e:
-            print(f"seller_sent_pending_verification sync deferred for {entry.get('trade_id')}: {e}")
-            upsert_seller_pending_verification({**entry, "sync_error": str(e), "last_checked_at": now.isoformat(timespec="seconds")})
+            logger.warning(f"seller_sent_pending_verification sync deferred for {entry.get('trade_id')}: {e}")
+            upsert_seller_pending_verification({
+                **entry,
+                "sync_error": str(e),
+                "sync_error_transient": _is_transient_error(e),
+                "last_checked_at": now.isoformat(timespec="seconds"),
+            })
 
 
 async def seller_pending_should_hold_without_resend(client: SteamClient, trade: dict, entry: dict, cache: SteamOfferCache = None) -> bool:
@@ -541,17 +639,18 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
         if hist_id is not None:
             upsert_seller_pending_verification({**base_update, "steam_offer_id": hist_id, "steam_offer_status": hist_status.name if hist_status else "ACCEPTED", "note": "Покупатель принял (или эскроу)"})
             return True
-        upsert_seller_pending_verification({**base_update, "sync_error": None, "note": "Оффер не найден"})
+        upsert_seller_pending_verification({**base_update, "sync_error": None, "sync_error_transient": None, "note": "Оффер не найден"})
         return True
 
     try:
         offer = await steam_api_call(lambda: client.get_trade_offer(steam_oid), client=client)
     except Exception as e:
-        upsert_seller_pending_verification({**base_update, **entry, "last_checked_at": now_iso, "sync_error": str(e)})
+        upsert_seller_pending_verification({**base_update, **entry, "last_checked_at": now_iso, "sync_error": str(e), "sync_error_transient": _is_transient_error(e)})
         return True
 
     st = offer.status
     base_update["sync_error"] = None
+    base_update["sync_error_transient"] = None
     if st in (TradeOfferStatus.ACTIVE, TradeOfferStatus.CONFIRMATION_NEED):
         upsert_seller_pending_verification({**base_update, "steam_offer_id": steam_oid, "steam_offer_status": st.name, "note": "Активен / ждёт подтверждения"})
         return True
@@ -579,13 +678,16 @@ def _extract_item_name_and_price(trade: dict) -> tuple[str, str]:
         or trade.get("item_name")
         or "unknown item"
     )
-    raw_price = (
-        trade.get("price")
-        or trade.get("sale_price")
-        or trade.get("listed_price")
-        or trade.get("total_price")
-        or contract.get("price")
-        or item.get("price")
+    raw_price = next(
+        (p for p in (
+            trade.get("price"),
+            trade.get("sale_price"),
+            trade.get("listed_price"),
+            trade.get("total_price"),
+            contract.get("price"),
+            item.get("price"),
+        ) if p is not None),
+        None,
     )
     currency = trade.get("currency") or "USD"
     if raw_price is None:
@@ -623,17 +725,17 @@ async def get_user_info(session, csfloat_api_key):
             async with session.get(API_USER_INFO, headers=headers) as response:
                 if response.status == 429:
                     delay = _retry_after_seconds(response, CSFLOAT_429_RETRY_DELAY_SEC)
-                    print(f"get_user_info: CSFloat 429, повтор через {delay:.0f} сек")
+                    logger.warning(f"get_user_info: CSFloat 429, повтор через {delay:.0f} сек")
                     if attempt < 2:
-                        await asyncio.sleep(delay)
+                        await asyncio.sleep(with_jitter(delay))
                         continue
                     return None
                 response.raise_for_status()
                 return await response.json()
         except Exception as e:
-            print(f"get_user_info error: {e}")
+            logger.warning(f"get_user_info error: {e}")
             if attempt < 2:
-                await asyncio.sleep(2 * attempt)
+                await asyncio.sleep(with_jitter(2 * attempt))
                 continue
     return None
 
@@ -645,17 +747,17 @@ async def get_trades(session, csfloat_api_key):
             async with session.get(API_TRADES, headers=headers) as response:
                 if response.status == 429:
                     delay = _retry_after_seconds(response, CSFLOAT_429_RETRY_DELAY_SEC)
-                    print(f"get_trades: CSFloat 429, повтор через {delay:.0f} сек")
+                    logger.warning(f"get_trades: CSFloat 429, повтор через {delay:.0f} сек")
                     if attempt < 2:
-                        await asyncio.sleep(delay)
+                        await asyncio.sleep(with_jitter(delay))
                         continue
                     return None
                 response.raise_for_status()
                 return await response.json()
         except Exception as e:
-            print(f"get_trades error: {e}")
+            logger.warning(f"get_trades error: {e}")
             if attempt < 2:
-                await asyncio.sleep(2 * attempt)
+                await asyncio.sleep(with_jitter(2 * attempt))
                 continue
     return None
 
@@ -668,17 +770,17 @@ async def accept_trade(session, csfloat_api_key, trade_id, trade_token):
             async with session.post(url, headers=headers, json={'trade_token': trade_token}) as response:
                 if response.status == 429:
                     delay = _retry_after_seconds(response, CSFLOAT_429_RETRY_DELAY_SEC)
-                    print(f"CSFloat accept rate limited {trade_id}; повтор через {delay:.0f} сек")
+                    logger.warning(f"CSFloat accept rate limited {trade_id}; повтор через {delay:.0f} сек")
                     if attempt < 2:
-                        await asyncio.sleep(delay)
+                        await asyncio.sleep(with_jitter(delay))
                         continue
                     return False
                 if response.status != 200:
-                    print(f"CSFloat accept failed {trade_id}: {response.status} {await response.text()}")
+                    logger.warning(f"CSFloat accept failed {trade_id}: {response.status} {await response.text()}")
                     return False
                 return True
         except Exception as e:
-            print(f"CSFloat accept error {trade_id}: {e}")
+            logger.warning(f"CSFloat accept error {trade_id}: {e}")
             return False
     return False
 
@@ -725,7 +827,7 @@ def install_steam_mobileconf_throttle(client: SteamGuardMixin):
         async with lock:
             elapsed = time.monotonic() - last_call
             if elapsed < STEAM_MOBILECONF_MIN_INTERVAL_SEC:
-                await asyncio.sleep(STEAM_MOBILECONF_MIN_INTERVAL_SEC - elapsed)
+                await asyncio.sleep(with_jitter(STEAM_MOBILECONF_MIN_INTERVAL_SEC - elapsed))
             result = await orig(*args, **kwargs)
             last_call = time.monotonic()
             return result
@@ -762,7 +864,7 @@ async def send_steam_trade(
     try:
         asset_id_int = int(asset_id)
     except (TypeError, ValueError):
-        print(f"Trade {trade_id}: некорректный asset_id={asset_id}")
+        logger.warning(f"Trade {trade_id}: некорректный asset_id={asset_id}")
         return False
 
     try:
@@ -771,12 +873,12 @@ async def send_steam_trade(
     except SteamRateLimited:
         raise
     except Exception as e:
-        print(f"Trade {trade_id}: ошибка загрузки инвентаря: {e}")
+        logger.warning(f"Trade {trade_id}: ошибка загрузки инвентаря: {e}")
         return False
 
     item_to_give = next((it for it in my_inv if it.asset_id == asset_id_int), None)
     if not item_to_give:
-        print(f"Trade {trade_id}: предмет с asset_id {asset_id} не найден")
+        logger.warning(f"Trade {trade_id}: предмет с asset_id {asset_id} не найден")
         return False
 
     message = csfloat_steam_offer_message(trade_id)
@@ -784,13 +886,13 @@ async def send_steam_trade(
     if trade_url:
         target_steam_id, final_token = _parse_trade_url(trade_url)
         if not target_steam_id:
-            print(f"Trade {trade_id}: не удалось извлечь partner_id из trade_url")
+            logger.warning(f"Trade {trade_id}: не удалось извлечь partner_id из trade_url")
             return False
     elif buyer_steam_id:
         target_steam_id = int(buyer_steam_id)
         final_token = trade_token
     else:
-        print(f"Trade {trade_id}: нет buyer_steam_id или trade_url")
+        logger.warning(f"Trade {trade_id}: нет buyer_steam_id или trade_url")
         return False
 
     for attempt in range(1, SEND_TRADE_MAX_RETRIES + 1):
@@ -806,28 +908,28 @@ async def send_steam_trade(
 
             offer_id = await steam_api_call(lambda: client.make_trade_offer(target_steam_id, **kwargs), client=client)
             if offer_id:
-                print(f"Trade {trade_id}: оффер {offer_id} создан")
+                logger.info(f"Trade {trade_id}: оффер {offer_id} создан")
                 return offer_id
-            print(f"Trade {trade_id}: make_trade_offer вернул None/False")
+            logger.warning(f"Trade {trade_id}: make_trade_offer вернул None/False")
             return False
         except aiohttp.ClientResponseError as http_err:
             if http_err.status == 429:
                 _set_steam_backoff()
-                print(f"Trade {trade_id}: Steam rate limited; cooldown {STEAM_RATE_LIMIT_BACKOFF_SEC}s")
+                logger.warning(f"Trade {trade_id}: Steam rate limited; cooldown {STEAM_RATE_LIMIT_BACKOFF_SEC}s")
                 raise SteamRateLimited(f"Steam rate limited on trade {trade_id}") from http_err
             elif http_err.status == 500 and attempt < SEND_TRADE_MAX_RETRIES:
-                print(f"Trade {trade_id}: 500, повтор через {SEND_TRADE_RETRY_DELAY_SEC} сек")
-                await asyncio.sleep(SEND_TRADE_RETRY_DELAY_SEC)
+                logger.warning(f"Trade {trade_id}: 500, повтор через {SEND_TRADE_RETRY_DELAY_SEC} сек")
+                await asyncio.sleep(with_jitter(SEND_TRADE_RETRY_DELAY_SEC))
                 continue
             else:
-                print(f"Trade {trade_id}: HTTP {http_err.status} – {http_err}")
+                logger.warning(f"Trade {trade_id}: HTTP {http_err.status} – {http_err}")
                 return False
         except SteamRateLimited:
             raise
         except Exception as e:
-            print(f"Trade {trade_id}: ошибка отправки: {e}")
+            logger.warning(f"Trade {trade_id}: ошибка отправки: {e}")
             if attempt < SEND_TRADE_MAX_RETRIES:
-                await asyncio.sleep(SEND_TRADE_RETRY_DELAY_SEC)
+                await asyncio.sleep(with_jitter(SEND_TRADE_RETRY_DELAY_SEC))
                 continue
             return False
     return False
@@ -836,13 +938,13 @@ async def send_steam_trade(
 async def send_steam_trade_limited(client: SteamClient, *, sends_this_pass: int, **kwargs):
     if sends_this_pass >= MAX_STEAM_SENDS_PER_PASS:
         trade_id = kwargs.get("trade_id", "?")
-        print(f"Trade {trade_id}: лимит отправок за проход исчерпан, отложено")
+        logger.info(f"Trade {trade_id}: лимит отправок за проход исчерпан, отложено")
         return None, sends_this_pass, True
 
     offer_id = await send_steam_trade(client, **kwargs)
     if offer_id:
         sends_this_pass += 1
-        await asyncio.sleep(STEAM_SEND_COOLDOWN_SEC)
+        await asyncio.sleep(with_jitter(STEAM_SEND_COOLDOWN_SEC))
     return offer_id, sends_this_pass, False
 
 
@@ -858,13 +960,14 @@ async def confirm_offers_via_asf(expected_count=None, max_retries=3, retry_delay
                     response.raise_for_status()
                     bots = await response.json()
                     if not bots.get("result"):
-                        print("No active bots found in ASF; set bot_name in asf.json")
+                        logger.warning("No active bots found in ASF; set bot_name in asf.json")
                         return False
                     bot_name = next(iter(bots["result"]))
             except Exception as e:
-                print(f"ASF bot lookup failed: {e}")
+                logger.warning(f"ASF bot lookup failed: {e}")
                 return False
 
+    needed = expected_count if expected_count else 1
     for attempt in range(1, max_retries + 1):
         try:
             async with aiohttp.ClientSession() as session:
@@ -874,7 +977,7 @@ async def confirm_offers_via_asf(expected_count=None, max_retries=3, retry_delay
                     headers={"Authentication": ASF_PASSWORD}
                 ) as response:
                     if response.status == 429 and attempt < max_retries:
-                        await asyncio.sleep(retry_delay * 2)
+                        await asyncio.sleep(with_jitter(retry_delay * 2))
                         continue
                     response.raise_for_status()
                     data = await response.json()
@@ -883,14 +986,14 @@ async def confirm_offers_via_asf(expected_count=None, max_retries=3, retry_delay
                     result = data.get("Result", "")
                     match = re.search(r"Successfully handled (\d+) confirmations", str(result))
                     handled = int(match.group(1)) if match else 0
-                    if handled > 0:
-                        print(f"ASF confirmed {handled} offer(s)")
+                    if handled >= needed:
+                        logger.info(f"ASF confirmed {handled}/{needed} offer(s)")
                         return True
-                    print(f"ASF handled 0 confirmations (attempt {attempt}/{max_retries})")
+                    logger.warning(f"ASF handled {handled}/{needed} confirmations (attempt {attempt}/{max_retries})")
         except Exception as e:
-            print(f"ASF confirmation failed (attempt {attempt}/{max_retries}): {e}")
+            logger.warning(f"ASF confirmation failed (attempt {attempt}/{max_retries}): {e}")
         if attempt < max_retries:
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(with_jitter(retry_delay))
     return False
 
 
@@ -904,10 +1007,10 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
 
     user_info = await get_user_info(session, csfloat_api_key)
     if not user_info or user_info.get('actionable_trades', 0) == 0:
-        print(f"No actionable trades. Waiting {CHECK_INTERVAL_MINUTES} min.")
+        logger.info(f"No actionable trades. Waiting {CHECK_INTERVAL_MINUTES} min.")
         return
 
-    print("Actionable trades found, fetching trade details...")
+    logger.info("Actionable trades found, fetching trade details...")
     trades_info = await get_trades(session, csfloat_api_key)
     if not isinstance(trades_info, dict):
         return
@@ -942,7 +1045,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
         trade_state = trade.get('state')
 
         if trade_state == "verified":
-            processed_trades.add(str(trade_id))
+            _mark_processed(processed_trades, trade_id)
             remove_seller_pending_verification(trade_id)
             continue
 
@@ -957,16 +1060,16 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
 
         pending_entry = seller_pending_by_id.get(str(trade_id))
         if pending_entry and my_steam_id64 == sid and my_steam_id64 != bid:
-            processed_trades.add(str(trade_id))
+            _mark_processed(processed_trades, trade_id)
             stats["seller_waiting_verified"] += 1
             continue
 
         if str(trade_id) in processed_trades:
             if my_steam_id64 == bid and my_steam_id64 != sid:
-                processed_trades.discard(str(trade_id))
+                processed_trades.pop(str(trade_id), None)
             if str(trade_id) not in seller_pending_csfloat_ids:
                 continue
-            processed_trades.discard(str(trade_id))
+            processed_trades.pop(str(trade_id), None)
 
         if my_steam_id64 == bid and my_steam_id64 != sid:
             previous = next(
@@ -977,9 +1080,9 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
             previous_state = previous.get("csfloat_state") if previous else None
             if previous_state != trade_state:
                 if previous_state is None:
-                    print(f"Purchased item: {item_name} ({sale_price}), trade {trade_id}, state={trade_state}")
+                    logger.info(f"Purchased item: {item_name} ({sale_price}), trade {trade_id}, state={trade_state}")
                 else:
-                    print(f"Buyer trade {trade_id} status changed: {previous_state} -> {trade_state}")
+                    logger.info(f"Buyer trade {trade_id} status changed: {previous_state} -> {trade_state}")
             upsert_buyer_purchase({
                 "trade_id": str(trade_id),
                 "item_name": item_name,
@@ -989,8 +1092,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 "csfloat_state": trade_state or "unknown",
                 "last_checked_at": datetime.now().isoformat(timespec="seconds"),
             })
-            if str(trade_id) in processed_trades:
-                processed_trades.discard(str(trade_id))
+            processed_trades.pop(str(trade_id), None)
             continue
 
         if my_steam_id64 != sid:
@@ -1001,7 +1103,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
         sent_offer_id = None
 
         if not trade.get("accepted_at"):
-            print(f"Accepting CSFloat trade {trade_id} ({item_name}, {sale_price})...")
+            logger.info(f"Accepting CSFloat trade {trade_id} ({item_name}, {sale_price})...")
             if not await accept_trade(session, csfloat_api_key, str(trade_id), trade_token):
                 stats["failed"] += 1
                 continue
@@ -1024,7 +1126,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 "note": "Оффер уже отправлялся ранее; ждём verified на CSFloat",
             })
         else:
-            print(f"Trade {trade_id} уже принято. Отправка '{item_name}' за {sale_price}.")
+            logger.info(f"Trade {trade_id} уже принято. Отправка '{item_name}' за {sale_price}.")
             try:
                 offer_id, sends_this_pass, deferred = await send_steam_trade_limited(
                     client, sends_this_pass=sends_this_pass,
@@ -1033,7 +1135,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 )
             except SteamRateLimited as e:
                 consecutive_429_errors += 1
-                print(f"Trade {trade_id}: Steam 429 ({e}); пропускаем оставшиеся трейды прохода")
+                logger.warning(f"Trade {trade_id}: Steam 429 ({e}); пропускаем оставшиеся трейды прохода")
                 continue
             except aiohttp.ClientResponseError as e:
                 if e.status == 429:
@@ -1047,7 +1149,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
             if offer_id:
                 send_success = True
                 sent_offer_id = int(offer_id)
-                print(f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}.")
+                logger.info(f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}.")
                 await send_telegram_notification(f"CSFloat sale sent\nTrade: {trade_id}\nItem: {item_name}\nPrice: {sale_price}")
             else:
                 try:
@@ -1058,7 +1160,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                     send_success = True
                     sent_offer_id = int(existing_offer_id)
         if send_success:
-            processed_trades.add(str(trade_id))
+            _mark_processed(processed_trades, trade_id)
             stats["seller_sent"] += 1
             upsert_seller_pending_verification({
                 "trade_id": str(trade_id), "item_name": item_name, "sale_price": sale_price,
@@ -1070,7 +1172,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 "note": "Оффер создан, требуется подтверждение через ASF",
             })
         else:
-            print(f"Trade {trade_id} не помечен как обработанный — повторная попытка при следующей проверке.")
+            logger.warning(f"Trade {trade_id} не помечен как обработанный — повторная попытка при следующей проверке.")
             stats["failed"] += 1
 
     pending_all = load_seller_pending_verification_log()
@@ -1082,7 +1184,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 offers_to_confirm.append(oid)
 
     if offers_to_confirm:
-        print(f"Confirming {len(offers_to_confirm)} Steam offer(s) through ASF...")
+        logger.info(f"Confirming {len(offers_to_confirm)} Steam offer(s) through ASF...")
         if await confirm_offers_via_asf(expected_count=len(offers_to_confirm)):
             for oid in offers_to_confirm:
                 for entry in pending_all:
@@ -1093,7 +1195,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                         upsert_seller_pending_verification(entry)
                         break
 
-    print(
+    logger.info(
         f"Trade pass summary: total={stats['total']}, sent={stats['seller_sent']}, "
         f"waiting_verified={stats['seller_waiting_verified']}, "
         f"deferred={stats['deferred']}, skipped_429={stats['skipped_429']}, "
@@ -1120,16 +1222,16 @@ async def _startup_login(client) -> bool:
                     await client.login()
             else:
                 await client.login()
-            print("Steam login OK.")
+            logger.info("Steam login OK.")
             return True
         except Exception as e:
             failures += 1
-            print(f"Steam login failed ({failures}): {e}. Повтор через {delay} сек.")
+            logger.warning(f"Steam login failed ({failures}): {e}. Повтор через {int(delay)} сек.")
             if failures == 3:
                 await send_telegram_notification(
                     "Steam login failed 3 times. Check credentials / cookies. Bot keeps retrying."
                 )
-            await asyncio.sleep(delay)
+            await asyncio.sleep(with_jitter(delay))
             delay = min(delay * 2, 30 * 60)
 
 
@@ -1144,7 +1246,7 @@ async def main():
         shared_secret = config['shared_secret']
         identity_secret = config['identity_secret']
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
-        print(f"Не удалось загрузить steam.json: {e}. Проверь файл конфигурации.")
+        logger.error(f"Не удалось загрузить steam.json: {e}. Проверь файл конфигурации.")
         return
 
     class MySteamClient(SteamClient, SteamWebApiMixin, SteamGuardMixin):
@@ -1175,8 +1277,8 @@ async def main():
                     await check_actionable_trades(session, csfloat_api_key, client, processed_trades)
                     save_processed_trades(processed_trades)
                 except Exception as e:
-                    print(f"Trade pass failed; bot will retry after {CHECK_INTERVAL_MINUTES} min: {e}")
-                await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
+                    logger.error(f"Trade pass failed; bot will retry after {CHECK_INTERVAL_MINUTES} min: {e}")
+                await asyncio.sleep(with_jitter(CHECK_INTERVAL_MINUTES * 60))
         finally:
             _save_steam_cookies(client)
             await client.session.close()

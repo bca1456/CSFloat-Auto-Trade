@@ -1,3 +1,4 @@
-aiohttp
-aiosteampy
-protobuf
+aiosteampy==0.7.20
+aiohttp==3.12.15
+protobuf==7.34.0
+rsa==4.9.1
