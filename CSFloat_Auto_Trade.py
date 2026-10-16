@@ -14,6 +14,7 @@ from aiosteampy.mixins.guard import SteamGuardMixin
 from aiosteampy.mixins.web_api import SteamWebApiMixin
 from aiosteampy.models import ItemDescription, EconItem, BaseTradeOfferItem
 from aiosteampy.constants import TradeOfferStatus, TRADABLE_AFTER_DATE_FORMAT
+from aiosteampy.exceptions import SessionExpired
 
 # =============================================================================
 # ПАТЧИ ДЛЯ AIOSTEAMPY (фикс парсинга дат и inspect-ссылок)
@@ -90,6 +91,7 @@ SELLER_PENDING_VERIFICATION_LOG_FILE = Path("seller_sent_pending_verification.js
 BUYER_PURCHASES_LOG_FILE = Path("buyer_purchases_log.json")
 TG_CONFIG_FILE = Path("tg.json")
 STEAM_BACKOFF_FILE = Path("steam_rate_limit.json")
+STEAM_AUTH_BACKOFF_FILE = Path("steam_auth_backoff.json")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -107,36 +109,55 @@ SEND_TRADE_RETRY_DELAY_SEC = 15       # пауза при 500
 # Порог ошибок 429, после которого пропускаем оставшиеся трейды
 MAX_429_ERRORS_PER_PASS = 2
 
+# Авторизация Steam: при протухшей сессии бот перелогинивается,
+# а при повторных неудачах логина полностью останавливает Steam-действия.
+STEAM_AUTH_BACKOFF_SEC = 60 * 60   # пауза после серии неудачных релогинов
+MAX_STEAM_AUTH_FAILURES = 3        # сколько неудачных релогинов терпеть
+
 _steam_api_lock = None
 _steam_last_api_call = 0.0
+_steam_auth_failures = 0
 try:
     _steam_backoff_until = datetime.fromisoformat(json.loads(STEAM_BACKOFF_FILE.read_text(encoding="utf-8"))["until"]).timestamp()
     _steam_backoff_until = time.monotonic() + max(0, _steam_backoff_until - time.time())
 except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
     _steam_backoff_until = 0.0
+try:
+    _steam_auth_backoff_until = datetime.fromisoformat(json.loads(STEAM_AUTH_BACKOFF_FILE.read_text(encoding="utf-8"))["until"]).timestamp()
+    _steam_auth_backoff_until = time.monotonic() + max(0, _steam_auth_backoff_until - time.time())
+except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+    _steam_auth_backoff_until = 0.0
 
 
-async def steam_api_call(awaitable_factory):
-    """Serialize Steam requests and apply a process-wide cooldown after HTTP 429."""
+async def steam_api_call(awaitable_factory, *, client=None):
+    """Serialize Steam requests, apply cooldown after HTTP 429 and re-login on session expiry."""
     global _steam_api_lock, _steam_last_api_call
     if _steam_api_lock is None:
         _steam_api_lock = asyncio.Lock()
     async with _steam_api_lock:
-        now = time.monotonic()
-        if _steam_backoff_until > now:
-            raise RuntimeError(f"Steam API cooldown active for {int(_steam_backoff_until - now)}s")
-        wait_for = STEAM_API_MIN_INTERVAL_SEC - (now - _steam_last_api_call)
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        try:
-            result = await awaitable_factory()
-        except Exception as exc:
-            error_text = str(exc).lower()
-            if getattr(exc, "status", None) == 429 or "429" in error_text or "rate limited" in error_text or "rate limit" in error_text:
-                _set_steam_backoff()
-            raise
-        _steam_last_api_call = time.monotonic()
-        return result
+        for attempt in range(2):
+            now = time.monotonic()
+            if _steam_backoff_until > now:
+                raise RuntimeError(f"Steam API cooldown active for {int(_steam_backoff_until - now)}s")
+            if _steam_auth_backoff_until > now:
+                raise RuntimeError(f"Steam auth cooldown active for {int(_steam_auth_backoff_until - now)}s")
+            wait_for = STEAM_API_MIN_INTERVAL_SEC - (now - _steam_last_api_call)
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+            try:
+                result = await awaitable_factory()
+            except Exception as exc:
+                error_text = str(exc).lower()
+                if getattr(exc, "status", None) == 429 or "429" in error_text or "rate limited" in error_text or "rate limit" in error_text:
+                    _set_steam_backoff()
+                    raise
+                if attempt == 0 and client is not None and _is_auth_error(exc):
+                    if await _reauthenticate(client):
+                        _steam_last_api_call = time.monotonic()
+                        continue
+                raise
+            _steam_last_api_call = time.monotonic()
+            return result
 
 
 def _set_steam_backoff():
@@ -144,6 +165,64 @@ def _set_steam_backoff():
     _steam_backoff_until = max(_steam_backoff_until, time.monotonic() + STEAM_RATE_LIMIT_BACKOFF_SEC)
     until = datetime.fromtimestamp(time.time() + STEAM_RATE_LIMIT_BACKOFF_SEC).isoformat(timespec="seconds")
     STEAM_BACKOFF_FILE.write_text(json.dumps({"until": until}, indent=2), encoding="utf-8")
+
+
+def _set_steam_auth_backoff():
+    global _steam_auth_backoff_until
+    _steam_auth_backoff_until = max(_steam_auth_backoff_until, time.monotonic() + STEAM_AUTH_BACKOFF_SEC)
+    until = datetime.fromtimestamp(time.time() + STEAM_AUTH_BACKOFF_SEC).isoformat(timespec="seconds")
+    try:
+        STEAM_AUTH_BACKOFF_FILE.write_text(json.dumps({"until": until}, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_steam_auth_backoff():
+    global _steam_auth_backoff_until
+    _steam_auth_backoff_until = 0.0
+    try:
+        STEAM_AUTH_BACKOFF_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    if isinstance(exc, SessionExpired):
+        return True
+    if getattr(exc, "status", None) == 401:
+        return True
+    error_text = str(exc).lower()
+    return "401" in error_text and "unauthorized" in error_text
+
+
+def _save_steam_cookies(client):
+    try:
+        with COOKIE_FILE.open("w") as f:
+            json.dump(get_jsonable_cookies(client.session), f, indent=2)
+    except Exception as e:
+        print(f"Failed to persist Steam cookies: {e}")
+
+
+async def _reauthenticate(client) -> bool:
+    """Re-login after a session expiry. Applies a long cooldown after repeated failures."""
+    global _steam_auth_failures
+    try:
+        await client.login(init_session=False)
+    except Exception as e:
+        _steam_auth_failures += 1
+        print(f"Steam re-login failed ({_steam_auth_failures}/{MAX_STEAM_AUTH_FAILURES}): {e}")
+        if _steam_auth_failures >= MAX_STEAM_AUTH_FAILURES:
+            _set_steam_auth_backoff()
+            await send_telegram_notification(
+                "Steam re-login keeps failing. Pausing all Steam actions for 1 hour "
+                "to avoid account restrictions. Check credentials / session manually."
+            )
+        return False
+    _steam_auth_failures = 0
+    _clear_steam_auth_backoff()
+    _save_steam_cookies(client)
+    print("Steam session re-authenticated successfully.")
+    return True
 
 # ==================== НАСТРОЙКИ ASF IPC (загружаются из asf.json) ====================
 
@@ -284,7 +363,7 @@ def load_seller_pending_by_trade_id() -> dict[str, dict]:
 # =============================================================================
 
 async def _find_active_sent_offer_giving_asset(client: SteamClient, partner_steam_id64: int, asset_id_int: int):
-    sent, _, _ = await steam_api_call(lambda: client.get_trade_offers(active_only=True, sent=True, received=False))
+    sent, _, _ = await steam_api_call(lambda: client.get_trade_offers(active_only=True, sent=True, received=False), client=client)
     for off in sent:
         if not getattr(off, "is_our_offer", True):
             continue
@@ -301,7 +380,7 @@ async def _find_recent_historical_sent_accepted_for_asset(client: SteamClient, p
     for _ in range(2):
         sent, _, next_cursor = await steam_api_call(lambda: client.get_trade_offers(
             historical_only=True, sent=True, received=False, cursor=cursor
-        ))
+        ), client=client)
         for off in sent:
             if off.partner_id64 != partner_steam_id64:
                 continue
@@ -418,7 +497,7 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
         return True
 
     try:
-        offer = await steam_api_call(lambda: client.get_trade_offer(steam_oid))
+        offer = await steam_api_call(lambda: client.get_trade_offer(steam_oid), client=client)
     except Exception as e:
         upsert_seller_pending_verification({**base_update, **entry, "last_checked_at": now_iso, "sync_error": str(e)})
         return True
@@ -598,7 +677,7 @@ async def send_steam_trade(
         return False
 
     try:
-        inv_result = await steam_api_call(lambda: client.get_inventory(AppContext.CS2))
+        inv_result = await steam_api_call(lambda: client.get_inventory(AppContext.CS2), client=client)
         my_inv = inv_result[0] if (isinstance(inv_result, (tuple, list)) and inv_result) else []
     except Exception as e:
         print(f"Trade {trade_id}: ошибка загрузки инвентаря: {e}")
@@ -634,7 +713,7 @@ async def send_steam_trade(
             if final_token:
                 kwargs["token"] = final_token
 
-            offer_id = await steam_api_call(lambda: client.make_trade_offer(target_steam_id, **kwargs))
+            offer_id = await steam_api_call(lambda: client.make_trade_offer(target_steam_id, **kwargs), client=client)
             if offer_id:
                 print(f"Trade {trade_id}: оффер {offer_id} создан")
                 return offer_id
