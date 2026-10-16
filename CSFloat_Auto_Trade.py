@@ -16,6 +16,10 @@ from aiosteampy.models import ItemDescription, EconItem, BaseTradeOfferItem
 from aiosteampy.constants import TradeOfferStatus, TRADABLE_AFTER_DATE_FORMAT
 from aiosteampy.exceptions import SessionExpired
 
+
+class SteamRateLimited(RuntimeError):
+    """Steam ограничил запросы (HTTP 429) или действует пауза после лимита."""
+
 # =============================================================================
 # ПАТЧИ ДЛЯ AIOSTEAMPY (фикс парсинга дат и inspect-ссылок)
 # =============================================================================
@@ -103,8 +107,8 @@ STEAM_SEND_COOLDOWN_SEC = 15          # пауза между созданием
 MAX_STEAM_SENDS_PER_PASS = 15          # макс. офферов за один проход
 STEAM_MOBILECONF_MIN_INTERVAL_SEC = 15 # минимальный интервал между вызовами mobileconf/getlist
 SEND_TRADE_MAX_RETRIES = 1            # попыток при ошибке
-SEND_TRADE_RATE_LIMIT_DELAY_SEC = 300 # пауза при 429
 SEND_TRADE_RETRY_DELAY_SEC = 15       # пауза при 500
+CSFLOAT_429_RETRY_DELAY_SEC = 30      # пауза при 429 от CSFloat (если нет Retry-After)
 
 # Порог ошибок 429, после которого пропускаем оставшиеся трейды
 MAX_429_ERRORS_PER_PASS = 2
@@ -138,7 +142,7 @@ async def steam_api_call(awaitable_factory, *, client=None):
         for attempt in range(2):
             now = time.monotonic()
             if _steam_backoff_until > now:
-                raise RuntimeError(f"Steam API cooldown active for {int(_steam_backoff_until - now)}s")
+                raise SteamRateLimited(f"Steam API cooldown active for {int(_steam_backoff_until - now)}s")
             if _steam_auth_backoff_until > now:
                 raise RuntimeError(f"Steam auth cooldown active for {int(_steam_auth_backoff_until - now)}s")
             wait_for = STEAM_API_MIN_INTERVAL_SEC - (now - _steam_last_api_call)
@@ -150,7 +154,7 @@ async def steam_api_call(awaitable_factory, *, client=None):
                 error_text = str(exc).lower()
                 if getattr(exc, "status", None) == 429 or "429" in error_text or "rate limited" in error_text or "rate limit" in error_text:
                     _set_steam_backoff()
-                    raise
+                    raise SteamRateLimited(f"Steam rate limited; cooldown {STEAM_RATE_LIMIT_BACKOFF_SEC}s") from exc
                 if attempt == 0 and client is not None and _is_auth_error(exc):
                     if await _reauthenticate(client):
                         _steam_last_api_call = time.monotonic()
@@ -557,40 +561,82 @@ def _extract_item_name_and_price(trade: dict) -> tuple[str, str]:
 # CSFloat API
 # =============================================================================
 
+def _retry_after_seconds(response, default):
+    """Задержка из заголовка Retry-After (секунды) либо default."""
+    value = response.headers.get("Retry-After")
+    if value:
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    return default
+
+
 async def get_user_info(session, csfloat_api_key):
     headers = {'Authorization': csfloat_api_key}
-    try:
-        async with session.get(API_USER_INFO, headers=headers) as response:
-            response.raise_for_status()
-            return await response.json()
-    except Exception as e:
-        print(f"get_user_info error: {e}")
+    for attempt in range(1, 3):
+        try:
+            async with session.get(API_USER_INFO, headers=headers) as response:
+                if response.status == 429:
+                    delay = _retry_after_seconds(response, CSFLOAT_429_RETRY_DELAY_SEC)
+                    print(f"get_user_info: CSFloat 429, повтор через {delay:.0f} сек")
+                    if attempt < 2:
+                        await asyncio.sleep(delay)
+                        continue
+                    return None
+                response.raise_for_status()
+                return await response.json()
+        except Exception as e:
+            print(f"get_user_info error: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2 * attempt)
+                continue
     return None
 
 
 async def get_trades(session, csfloat_api_key):
     headers = {'Authorization': csfloat_api_key}
-    try:
-        async with session.get(API_TRADES, headers=headers) as response:
-            response.raise_for_status()
-            return await response.json()
-    except Exception as e:
-        print(f"get_trades error: {e}")
+    for attempt in range(1, 3):
+        try:
+            async with session.get(API_TRADES, headers=headers) as response:
+                if response.status == 429:
+                    delay = _retry_after_seconds(response, CSFLOAT_429_RETRY_DELAY_SEC)
+                    print(f"get_trades: CSFloat 429, повтор через {delay:.0f} сек")
+                    if attempt < 2:
+                        await asyncio.sleep(delay)
+                        continue
+                    return None
+                response.raise_for_status()
+                return await response.json()
+        except Exception as e:
+            print(f"get_trades error: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2 * attempt)
+                continue
     return None
 
 
 async def accept_trade(session, csfloat_api_key, trade_id, trade_token):
     url = API_ACCEPT_TRADE.format(trade_id=trade_id)
     headers = {'Authorization': csfloat_api_key, 'Content-Type': 'application/json'}
-    try:
-        async with session.post(url, headers=headers, json={'trade_token': trade_token}) as response:
-            if response.status != 200:
-                print(f"CSFloat accept failed {trade_id}: {response.status} {await response.text()}")
-                return False
-            return True
-    except Exception as e:
-        print(f"CSFloat accept error {trade_id}: {e}")
-        return False
+    for attempt in range(1, 3):
+        try:
+            async with session.post(url, headers=headers, json={'trade_token': trade_token}) as response:
+                if response.status == 429:
+                    delay = _retry_after_seconds(response, CSFLOAT_429_RETRY_DELAY_SEC)
+                    print(f"CSFloat accept rate limited {trade_id}; повтор через {delay:.0f} сек")
+                    if attempt < 2:
+                        await asyncio.sleep(delay)
+                        continue
+                    return False
+                if response.status != 200:
+                    print(f"CSFloat accept failed {trade_id}: {response.status} {await response.text()}")
+                    return False
+                return True
+        except Exception as e:
+            print(f"CSFloat accept error {trade_id}: {e}")
+            return False
+    return False
 
 
 def load_buyer_purchases_log():
@@ -679,6 +725,8 @@ async def send_steam_trade(
     try:
         inv_result = await steam_api_call(lambda: client.get_inventory(AppContext.CS2), client=client)
         my_inv = inv_result[0] if (isinstance(inv_result, (tuple, list)) and inv_result) else []
+    except SteamRateLimited:
+        raise
     except Exception as e:
         print(f"Trade {trade_id}: ошибка загрузки инвентаря: {e}")
         return False
@@ -723,7 +771,7 @@ async def send_steam_trade(
             if http_err.status == 429:
                 _set_steam_backoff()
                 print(f"Trade {trade_id}: Steam rate limited; cooldown {STEAM_RATE_LIMIT_BACKOFF_SEC}s")
-                return False
+                raise SteamRateLimited(f"Steam rate limited on trade {trade_id}") from http_err
             elif http_err.status == 500 and attempt < SEND_TRADE_MAX_RETRIES:
                 print(f"Trade {trade_id}: 500, повтор через {SEND_TRADE_RETRY_DELAY_SEC} сек")
                 await asyncio.sleep(SEND_TRADE_RETRY_DELAY_SEC)
@@ -731,6 +779,8 @@ async def send_steam_trade(
             else:
                 print(f"Trade {trade_id}: HTTP {http_err.status} – {http_err}")
                 return False
+        except SteamRateLimited:
+            raise
         except Exception as e:
             print(f"Trade {trade_id}: ошибка отправки: {e}")
             if attempt < SEND_TRADE_MAX_RETRIES:
@@ -937,6 +987,10 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                     trade_id=str(trade_id), buyer_steam_id=bid,
                     asset_id=int(asset_id), trade_token=trade_token, trade_url=trade_url
                 )
+            except SteamRateLimited as e:
+                consecutive_429_errors += 1
+                print(f"Trade {trade_id}: Steam 429 ({e}); пропускаем оставшиеся трейды прохода")
+                continue
             except aiohttp.ClientResponseError as e:
                 if e.status == 429:
                     consecutive_429_errors += 1
