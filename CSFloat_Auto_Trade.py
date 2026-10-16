@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import time
 import aiohttp
@@ -106,7 +107,7 @@ USER_AGENT = (
 STEAM_SEND_COOLDOWN_SEC = 15          # пауза между созданием офферов
 MAX_STEAM_SENDS_PER_PASS = 15          # макс. офферов за один проход
 STEAM_MOBILECONF_MIN_INTERVAL_SEC = 15 # минимальный интервал между вызовами mobileconf/getlist
-SEND_TRADE_MAX_RETRIES = 1            # попыток при ошибке
+SEND_TRADE_MAX_RETRIES = 2            # попыток при ошибке (1 попытка + 1 повтор)
 SEND_TRADE_RETRY_DELAY_SEC = 15       # пауза при 500
 CSFLOAT_429_RETRY_DELAY_SEC = 30      # пауза при 429 от CSFloat (если нет Retry-After)
 
@@ -168,7 +169,7 @@ def _set_steam_backoff():
     global _steam_backoff_until
     _steam_backoff_until = max(_steam_backoff_until, time.monotonic() + STEAM_RATE_LIMIT_BACKOFF_SEC)
     until = datetime.fromtimestamp(time.time() + STEAM_RATE_LIMIT_BACKOFF_SEC).isoformat(timespec="seconds")
-    STEAM_BACKOFF_FILE.write_text(json.dumps({"until": until}, indent=2), encoding="utf-8")
+    _atomic_write_json(STEAM_BACKOFF_FILE, {"until": until})
 
 
 def _set_steam_auth_backoff():
@@ -176,7 +177,7 @@ def _set_steam_auth_backoff():
     _steam_auth_backoff_until = max(_steam_auth_backoff_until, time.monotonic() + STEAM_AUTH_BACKOFF_SEC)
     until = datetime.fromtimestamp(time.time() + STEAM_AUTH_BACKOFF_SEC).isoformat(timespec="seconds")
     try:
-        STEAM_AUTH_BACKOFF_FILE.write_text(json.dumps({"until": until}, indent=2), encoding="utf-8")
+        _atomic_write_json(STEAM_AUTH_BACKOFF_FILE, {"until": until})
     except OSError:
         pass
 
@@ -201,8 +202,7 @@ def _is_auth_error(exc: Exception) -> bool:
 
 def _save_steam_cookies(client):
     try:
-        with COOKIE_FILE.open("w") as f:
-            json.dump(get_jsonable_cookies(client.session), f, indent=2)
+        _atomic_write_json(COOKIE_FILE, get_jsonable_cookies(client.session))
     except Exception as e:
         print(f"Failed to persist Steam cookies: {e}")
 
@@ -259,7 +259,7 @@ else:
 # =============================================================================
 
 def load_steam_config(config_path='steam.json'):
-    with open(config_path, 'r') as file:
+    with open(config_path, 'r', encoding='utf-8') as file:
         return json.load(file)
 
 
@@ -301,9 +301,19 @@ async def send_telegram_notification(text: str):
                 continue
 
 
+def _atomic_write_json(path: Path, data, *, ensure_ascii: bool = True):
+    """Атомарная запись JSON: temp-файл + os.replace, чтобы краш не повредил данные."""
+    tmp_path = path.with_name(path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=ensure_ascii)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
 def load_processed_trades():
     if PROCESSED_TRADES_FILE.is_file():
-        with PROCESSED_TRADES_FILE.open("r") as f:
+        with PROCESSED_TRADES_FILE.open("r", encoding="utf-8") as f:
             try:
                 return set(json.load(f))
             except json.JSONDecodeError:
@@ -312,8 +322,7 @@ def load_processed_trades():
 
 
 def save_processed_trades(processed_trades):
-    with PROCESSED_TRADES_FILE.open("w") as f:
-        json.dump(list(processed_trades), f, indent=2)
+    _atomic_write_json(PROCESSED_TRADES_FILE, list(processed_trades))
 
 
 def load_seller_pending_verification_log():
@@ -328,8 +337,7 @@ def load_seller_pending_verification_log():
 
 
 def save_seller_pending_verification_log(entries: list[dict]):
-    with SELLER_PENDING_VERIFICATION_LOG_FILE.open("w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
+    _atomic_write_json(SELLER_PENDING_VERIFICATION_LOG_FILE, entries, ensure_ascii=False)
 
 
 def upsert_seller_pending_verification(entry: dict):
@@ -366,8 +374,48 @@ def load_seller_pending_by_trade_id() -> dict[str, dict]:
 # ПОИСК УЖЕ ОТПРАВЛЕННЫХ STEAM-ОФФЕРОВ
 # =============================================================================
 
-async def _find_active_sent_offer_giving_asset(client: SteamClient, partner_steam_id64: int, asset_id_int: int):
-    sent, _, _ = await steam_api_call(lambda: client.get_trade_offers(active_only=True, sent=True, received=False), client=client)
+class SteamOfferCache:
+    """Кэш sent-офферов на один проход, чтобы не дёргать Steam Web API на каждый трейд."""
+
+    def __init__(self, client: SteamClient):
+        self.client = client
+        self._active = None
+        self._historical = None
+
+    async def active_sent(self):
+        if self._active is None:
+            sent, _, _ = await steam_api_call(
+                lambda: self.client.get_trade_offers(active_only=True, sent=True, received=False),
+                client=self.client,
+            )
+            self._active = sent
+        return self._active
+
+    async def historical_sent(self):
+        if self._historical is None:
+            offers = []
+            cursor = 0
+            for _ in range(2):
+                sent, _, next_cursor = await steam_api_call(
+                    lambda c=cursor: self.client.get_trade_offers(
+                        historical_only=True, sent=True, received=False, cursor=c
+                    ),
+                    client=self.client,
+                )
+                offers.extend(sent)
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+            self._historical = offers
+        return self._historical
+
+    def invalidate(self):
+        self._active = None
+        self._historical = None
+
+
+async def _find_active_sent_offer_giving_asset(cache: SteamOfferCache, partner_steam_id64: int, asset_id_int: int):
+    sent = await cache.active_sent()
     for off in sent:
         if not getattr(off, "is_our_offer", True):
             continue
@@ -379,31 +427,25 @@ async def _find_active_sent_offer_giving_asset(client: SteamClient, partner_stea
     return None
 
 
-async def _find_recent_historical_sent_accepted_for_asset(client: SteamClient, partner_steam_id64: int, asset_id_int: int):
-    cursor = 0
-    for _ in range(2):
-        sent, _, next_cursor = await steam_api_call(lambda: client.get_trade_offers(
-            historical_only=True, sent=True, received=False, cursor=cursor
-        ), client=client)
-        for off in sent:
-            if off.partner_id64 != partner_steam_id64:
-                continue
-            if off.status not in (TradeOfferStatus.ACCEPTED, TradeOfferStatus.STATE_IN_ESCROW):
-                continue
-            for it in off.items_to_give or ():
-                if getattr(it, "asset_id", None) == asset_id_int:
-                    return off.trade_offer_id, off.status
-        if not next_cursor:
-            break
-        cursor = next_cursor
+async def _find_recent_historical_sent_accepted_for_asset(cache: SteamOfferCache, partner_steam_id64: int, asset_id_int: int):
+    sent = await cache.historical_sent()
+    for off in sent:
+        if off.partner_id64 != partner_steam_id64:
+            continue
+        if off.status not in (TradeOfferStatus.ACCEPTED, TradeOfferStatus.STATE_IN_ESCROW):
+            continue
+        for it in off.items_to_give or ():
+            if getattr(it, "asset_id", None) == asset_id_int:
+                return off.trade_offer_id, off.status
     return None, None
 
 
-async def detect_existing_sent_offer_for_trade(client: SteamClient, buyer_id: int, asset_id: int):
-    active_id = await _find_active_sent_offer_giving_asset(client, buyer_id, asset_id)
+async def detect_existing_sent_offer_for_trade(client: SteamClient, buyer_id: int, asset_id: int, cache: SteamOfferCache = None):
+    cache = cache or SteamOfferCache(client)
+    active_id = await _find_active_sent_offer_giving_asset(cache, buyer_id, asset_id)
     if active_id is not None:
         return active_id, TradeOfferStatus.ACTIVE
-    hist_id, hist_status = await _find_recent_historical_sent_accepted_for_asset(client, buyer_id, asset_id)
+    hist_id, hist_status = await _find_recent_historical_sent_accepted_for_asset(cache, buyer_id, asset_id)
     if hist_id is not None:
         return hist_id, hist_status or TradeOfferStatus.ACCEPTED
     return None, None
@@ -427,7 +469,8 @@ def _synthetic_trade_from_pending_entry(entry: dict) -> dict:
     }
 
 
-async def refresh_all_seller_pending_verification_from_steam(client: SteamClient):
+async def refresh_all_seller_pending_verification_from_steam(client: SteamClient, cache: SteamOfferCache = None):
+    cache = cache or SteamOfferCache(client)
     entries = load_seller_pending_verification_log()
     now = datetime.now()
     due_entries = []
@@ -449,14 +492,15 @@ async def refresh_all_seller_pending_verification_from_steam(client: SteamClient
             continue
         try:
             await seller_pending_should_hold_without_resend(
-                client, _synthetic_trade_from_pending_entry(entry), entry
+                client, _synthetic_trade_from_pending_entry(entry), entry, cache
             )
         except Exception as e:
             print(f"seller_sent_pending_verification sync deferred for {entry.get('trade_id')}: {e}")
             upsert_seller_pending_verification({**entry, "sync_error": str(e), "last_checked_at": now.isoformat(timespec="seconds")})
 
 
-async def seller_pending_should_hold_without_resend(client: SteamClient, trade: dict, entry: dict) -> bool:
+async def seller_pending_should_hold_without_resend(client: SteamClient, trade: dict, entry: dict, cache: SteamOfferCache = None) -> bool:
+    cache = cache or SteamOfferCache(client)
     trade_id = str(trade.get("id"))
     trade_state = trade.get("state")
     item_name, sale_price = _extract_item_name_and_price(trade)
@@ -489,11 +533,11 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
             steam_oid = None
 
     if steam_oid is None:
-        active_id = await _find_active_sent_offer_giving_asset(client, buyer_id, asset_id_int)
+        active_id = await _find_active_sent_offer_giving_asset(cache, buyer_id, asset_id_int)
         if active_id is not None:
             upsert_seller_pending_verification({**base_update, "steam_offer_id": active_id, "steam_offer_status": "ACTIVE", "note": "Оффер в Steam активен"})
             return True
-        hist_id, hist_status = await _find_recent_historical_sent_accepted_for_asset(client, buyer_id, asset_id_int)
+        hist_id, hist_status = await _find_recent_historical_sent_accepted_for_asset(cache, buyer_id, asset_id_int)
         if hist_id is not None:
             upsert_seller_pending_verification({**base_update, "steam_offer_id": hist_id, "steam_offer_status": hist_status.name if hist_status else "ACCEPTED", "note": "Покупатель принял (или эскроу)"})
             return True
@@ -659,8 +703,7 @@ def upsert_buyer_purchase(entry: dict):
             break
     else:
         entries.append(entry)
-    with BUYER_PURCHASES_LOG_FILE.open("w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
+    _atomic_write_json(BUYER_PURCHASES_LOG_FILE, entries, ensure_ascii=False)
 
 
 # =============================================================================
@@ -856,7 +899,8 @@ async def confirm_offers_via_asf(expected_count=None, max_retries=3, retry_delay
 # =============================================================================
 
 async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMixin, processed_trades):
-    await refresh_all_seller_pending_verification_from_steam(client)
+    offer_cache = SteamOfferCache(client)
+    await refresh_all_seller_pending_verification_from_steam(client, offer_cache)
 
     user_info = await get_user_info(session, csfloat_api_key)
     if not user_info or user_info.get('actionable_trades', 0) == 0:
@@ -963,7 +1007,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 continue
 
         try:
-            existing_offer_id, existing_offer_status = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id))
+            existing_offer_id, existing_offer_status = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id), offer_cache)
         except Exception:
             existing_offer_id, existing_offer_status = None, None
 
@@ -1061,15 +1105,47 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
 # MAIN
 # =============================================================================
 
+async def _startup_login(client) -> bool:
+    """Авторизация на старте с ретраями, чтобы временный сбой не ронял бота."""
+    delay = 60
+    failures = 0
+    while True:
+        try:
+            if COOKIE_FILE.is_file():
+                try:
+                    with COOKIE_FILE.open("r", encoding="utf-8") as f:
+                        cookies = json.load(f)
+                    await restore_from_cookies(cookies, client)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    await client.login()
+            else:
+                await client.login()
+            print("Steam login OK.")
+            return True
+        except Exception as e:
+            failures += 1
+            print(f"Steam login failed ({failures}): {e}. Повтор через {delay} сек.")
+            if failures == 3:
+                await send_telegram_notification(
+                    "Steam login failed 3 times. Check credentials / cookies. Bot keeps retrying."
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30 * 60)
+
+
 async def main():
-    config = load_steam_config()
-    csfloat_api_key = config['csfloat_api_key']
-    steam_api_key = config['steam_api_key']
-    steam_id = int(config['steam_id64'])
-    steam_login = config['steam_login']
-    steam_password = config['steam_password']
-    shared_secret = config['shared_secret']
-    identity_secret = config['identity_secret']
+    try:
+        config = load_steam_config()
+        csfloat_api_key = config['csfloat_api_key']
+        steam_api_key = config['steam_api_key']
+        steam_id = int(config['steam_id64'])
+        steam_login = config['steam_login']
+        steam_password = config['steam_password']
+        shared_secret = config['shared_secret']
+        identity_secret = config['identity_secret']
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
+        print(f"Не удалось загрузить steam.json: {e}. Проверь файл конфигурации.")
+        return
 
     class MySteamClient(SteamClient, SteamWebApiMixin, SteamGuardMixin):
         pass
@@ -1086,12 +1162,7 @@ async def main():
 
     # install_steam_mobileconf_throttle(client)  # больше не нужно, т.к. подтверждения идут через ASF
 
-    if COOKIE_FILE.is_file():
-        with COOKIE_FILE.open("r") as f:
-            cookies = json.load(f)
-        await restore_from_cookies(cookies, client)
-    else:
-        await client.login()
+    await _startup_login(client)
 
     processed_trades = load_processed_trades()
 
@@ -1107,8 +1178,7 @@ async def main():
                     print(f"Trade pass failed; bot will retry after {CHECK_INTERVAL_MINUTES} min: {e}")
                 await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
         finally:
-            with COOKIE_FILE.open("w") as f:
-                json.dump(get_jsonable_cookies(client.session), f, indent=2)
+            _save_steam_cookies(client)
             await client.session.close()
 
 
