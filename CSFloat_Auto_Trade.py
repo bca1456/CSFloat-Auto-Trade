@@ -159,6 +159,7 @@ STEAM_HISTORY_LOOKBACK_DAYS = 365
 STEAM_SALE_REPORT_WINDOW_DAYS = 14
 STEAM_FINANCE_STATE_MAX_PROCESSED = 5000
 STEAM_FINANCE_STATE_MAX_EVENT_KEYS = 20000
+STEAM_FINANCE_CACHE_VERSION = 2
 
 API_USER_INFO = "https://csfloat.com/api/v1/me"
 API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"
@@ -528,6 +529,30 @@ def _save_steam_finance_state(state: dict):
     _atomic_write_json(STEAM_FINANCE_STATE_FILE, state, ensure_ascii=False)
 
 
+def _migrate_steam_finance_state(state: dict):
+    if state.get("cache_version") == STEAM_FINANCE_CACHE_VERSION:
+        return
+    old_sales = state.get("sale_events") if isinstance(state.get("sale_events"), dict) else {}
+    broken_sale_keys = set()
+    for key, sale in old_sales.items():
+        if not isinstance(sale, dict):
+            continue
+        try:
+            if int(sale.get("gross") or 0) == 0:
+                broken_sale_keys.add(str(key))
+        except (TypeError, ValueError):
+            broken_sale_keys.add(str(key))
+    state["processed_steam_sales"] = [
+        key for key in state.get("processed_steam_sales", [])
+        if str(key) not in broken_sale_keys
+    ]
+    state["purchases"] = {}
+    state["sale_events"] = {}
+    state["seen_event_keys"] = []
+    state.pop("last_sync_at", None)
+    state["cache_version"] = STEAM_FINANCE_CACHE_VERSION
+
+
 def _steam_event_key(event) -> str:
     if event.type == MarketHistoryEventType.LISTING_PURCHASED:
         new_asset_id = getattr(event.listing.item, "new_asset_id", None)
@@ -595,6 +620,7 @@ async def report_csfloat_withdrawal(trade_id, item_name, sale_price_text, asset_
 
 async def sync_steam_finance(client: SteamClient):
     state = _load_steam_finance_state()
+    _migrate_steam_finance_state(state)
     try:
         wallet = await steam_api_call(lambda: client.get_wallet_info(), client=client)
     except Exception as e:
@@ -671,18 +697,32 @@ async def sync_steam_finance(client: SteamClient):
             new_asset_id = getattr(listing.item, "new_asset_id", None)
             if new_asset_id is None:
                 continue
+            paid = int(listing.paid_amount or 0) + int(listing.paid_fee or 0)
+            if paid <= 0:
+                paid = int(listing.original_price or listing.price or 0)
             purchases[str(new_asset_id)] = {
                 "name": item_name,
-                "paid": int(listing.paid_amount or 0),
+                "paid": paid,
                 "currency": listing.currency.name if listing.currency else wallet_currency,
                 "time": (listing.time_sold or event.time_event).isoformat(timespec="seconds"),
             }
         elif event.type == MarketHistoryEventType.LISTING_SOLD:
+            buyer_paid = int(listing.paid_amount or 0) + int(listing.paid_fee or 0)
+            buyer_currency = listing.currency.name if listing.currency else wallet_currency
+            if listing.received_amount is not None:
+                net = int(listing.received_amount)
+                net_currency = (
+                    listing.received_currency.name if listing.received_currency else buyer_currency
+                )
+            else:
+                net = int(listing.original_price or 0)
+                net_currency = buyer_currency
             sale_cache[_steam_sale_event_key(event)] = {
                 "item_name": item_name,
-                "gross": int(listing.price or 0),
-                "fee": int(listing.fee or 0),
-                "currency": listing.currency.name if listing.currency else wallet_currency,
+                "buyer_paid": buyer_paid,
+                "buyer_currency": buyer_currency,
+                "net": net,
+                "net_currency": net_currency,
                 "time": event.time_event.isoformat(timespec="seconds"),
             }
 
@@ -724,23 +764,22 @@ async def sync_steam_finance(client: SteamClient):
 
         for _, key, sale in sorted(pending_sales):
             item_name = sale.get("item_name") or "unknown item"
-            gross = int(sale.get("gross") or 0)
-            fee = int(sale.get("fee") or 0)
-            net = max(0, gross - fee)
-            sale_currency = sale.get("currency") or wallet_currency
+            buyer_paid = int(sale.get("buyer_paid") or 0)
+            buyer_currency = sale.get("buyer_currency") or wallet_currency
+            net = int(sale.get("net") or 0)
+            net_currency = sale.get("net_currency") or wallet_currency
             matched = _find_csfloat_purchase_for_sale(purchases_log, item_name)
-            lines = [
-                f"Steam market sale: {item_name}",
-                f"Sold for: {gross / 100:.2f} {sale_currency}",
-                f"Steam net: {net / 100:.2f} {sale_currency}",
-            ]
+            lines = [f"Steam market sale: {item_name}"]
+            if buyer_paid > 0 and buyer_currency == net_currency:
+                lines.append(f"Buyer paid: {buyer_paid / 100:.2f} {buyer_currency}")
+            lines.append(f"Steam net: {net / 100:.2f} {net_currency}")
             update = None
             if matched:
                 cost_amount, cost_currency = _parse_price_text(matched.get("sale_price"))
                 if cost_amount is not None:
                     cost_line = f"Bought on CSFloat: {cost_amount:.2f} {cost_currency or ''}".rstrip()
                     lines.append(cost_line)
-                    if (cost_currency or sale_currency) == sale_currency and cost_amount > 0:
+                    if (cost_currency or net_currency) == net_currency and cost_amount > 0:
                         percent = (net / 100) / cost_amount * 100
                         lines.append(f"Deposit into Steam: {percent:+.1f}% net")
                     else:
@@ -750,7 +789,7 @@ async def sync_steam_finance(client: SteamClient):
                 update = {
                     "steam_sale_reported_at": now.isoformat(timespec="seconds"),
                     "steam_sale_net": net,
-                    "steam_sale_currency": sale_currency,
+                    "steam_sale_currency": net_currency,
                 }
             else:
                 lines.append("Bought on CSFloat: not found in purchase log")
