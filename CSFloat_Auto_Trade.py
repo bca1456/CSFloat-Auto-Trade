@@ -158,6 +158,7 @@ STEAM_MARKET_HISTORY_INCREMENTAL_MAX_PAGES = 5
 STEAM_HISTORY_LOOKBACK_DAYS = 365
 STEAM_SALE_REPORT_WINDOW_DAYS = 14
 STEAM_FINANCE_STATE_MAX_PROCESSED = 5000
+STEAM_FINANCE_STATE_MAX_EVENT_KEYS = 20000
 
 API_USER_INFO = "https://csfloat.com/api/v1/me"
 API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"
@@ -507,18 +508,35 @@ def _load_steam_finance_state() -> dict:
                     data["reported_withdrawals"] = {}
                 if not isinstance(data.get("processed_steam_sales"), list):
                     data["processed_steam_sales"] = []
+                if not isinstance(data.get("seen_event_keys"), list):
+                    data["seen_event_keys"] = []
+                if not isinstance(data.get("sale_events"), dict):
+                    data["sale_events"] = {}
                 return data
         except (OSError, json.JSONDecodeError):
             pass
-    return {"purchases": {}, "reported_withdrawals": {}, "processed_steam_sales": []}
+    return {
+        "purchases": {},
+        "reported_withdrawals": {},
+        "processed_steam_sales": [],
+        "seen_event_keys": [],
+        "sale_events": {},
+    }
 
 
 def _save_steam_finance_state(state: dict):
     _atomic_write_json(STEAM_FINANCE_STATE_FILE, state, ensure_ascii=False)
 
 
+def _steam_event_key(event) -> str:
+    if event.type == MarketHistoryEventType.LISTING_PURCHASED:
+        new_asset_id = getattr(event.listing.item, "new_asset_id", None)
+        return f"p:{new_asset_id}:{int(event.time_event.timestamp())}"
+    return f"s:{event.listing.id}:{int(event.time_event.timestamp())}"
+
+
 def _steam_sale_event_key(event) -> str:
-    return f"{event.listing.id}:{int(event.time_event.timestamp())}"
+    return _steam_event_key(event)
 
 
 def _find_csfloat_purchase_for_sale(purchases: list[dict], item_name: str):
@@ -611,6 +629,8 @@ async def sync_steam_finance(client: SteamClient):
 
     events = []
     history_ok = False
+    seen_order = [str(key) for key in state.get("seen_event_keys", [])]
+    seen = set(seen_order)
     for page in range(max_pages):
         start = page * STEAM_MARKET_HISTORY_PAGE_SIZE
         try:
@@ -625,14 +645,24 @@ async def sync_steam_finance(client: SteamClient):
             break
         history_ok = True
         events.extend(page_events)
+        page_keys = [_steam_event_key(event) for event in page_events]
+        page_has_new = any(key not in seen for key in page_keys)
+        for key in page_keys:
+            if key not in seen:
+                seen.add(key)
+                seen_order.append(key)
         if len(page_events) < STEAM_MARKET_HISTORY_PAGE_SIZE:
+            break
+        if last_sync is not None and not page_has_new:
             break
         page_oldest = min((e.time_event for e in page_events), default=None)
         if page_oldest is not None and page_oldest < stop_before:
             break
 
     purchases = state.get("purchases", {})
-    sale_events = []
+    sale_cache = state.get("sale_events", {})
+    if not isinstance(sale_cache, dict):
+        sale_cache = {}
     for event in events:
         listing = event.listing
         description = getattr(listing.item, "description", None)
@@ -648,7 +678,23 @@ async def sync_steam_finance(client: SteamClient):
                 "time": (listing.time_sold or event.time_event).isoformat(timespec="seconds"),
             }
         elif event.type == MarketHistoryEventType.LISTING_SOLD:
-            sale_events.append(event)
+            sale_cache[_steam_sale_event_key(event)] = {
+                "item_name": item_name,
+                "gross": int(listing.price or 0),
+                "fee": int(listing.fee or 0),
+                "currency": listing.currency.name if listing.currency else wallet_currency,
+                "time": event.time_event.isoformat(timespec="seconds"),
+            }
+
+    prune_before = now - timedelta(days=STEAM_SALE_REPORT_WINDOW_DAYS * 2)
+    for key in list(sale_cache):
+        try:
+            event_time = datetime.fromisoformat(sale_cache[key].get("time", ""))
+        except (TypeError, ValueError):
+            del sale_cache[key]
+            continue
+        if event_time < prune_before:
+            del sale_cache[key]
 
     processed_order = [str(key) for key in state.get("processed_steam_sales", [])]
     processed = set(processed_order)
@@ -662,20 +708,26 @@ async def sync_steam_finance(client: SteamClient):
     if balance_changed and history_ok:
         purchases_log = load_buyer_purchases_log()
         cutoff = now - timedelta(days=STEAM_SALE_REPORT_WINDOW_DAYS)
-        for event in sorted(sale_events, key=lambda e: e.time_event):
-            key = _steam_sale_event_key(event)
+        pending_sales = []
+        for key, sale in sale_cache.items():
             if key in processed:
                 continue
-            if event.time_event < cutoff:
+            try:
+                event_time = datetime.fromisoformat(sale.get("time", ""))
+            except (TypeError, ValueError):
                 mark_sale_processed(key)
                 continue
-            listing = event.listing
-            description = getattr(listing.item, "description", None)
-            item_name = getattr(description, "market_hash_name", None) or "unknown item"
-            gross = int(listing.price or 0)
-            fee = int(listing.fee or 0)
+            if event_time < cutoff:
+                mark_sale_processed(key)
+                continue
+            pending_sales.append((event_time, key, sale))
+
+        for _, key, sale in sorted(pending_sales):
+            item_name = sale.get("item_name") or "unknown item"
+            gross = int(sale.get("gross") or 0)
+            fee = int(sale.get("fee") or 0)
             net = max(0, gross - fee)
-            sale_currency = listing.currency.name if listing.currency else wallet_currency
+            sale_currency = sale.get("currency") or wallet_currency
             matched = _find_csfloat_purchase_for_sale(purchases_log, item_name)
             lines = [
                 f"Steam market sale: {item_name}",
@@ -711,7 +763,9 @@ async def sync_steam_finance(client: SteamClient):
     state["wallet_balance"] = balance
     state["wallet_currency"] = wallet_currency
     state["purchases"] = purchases
+    state["sale_events"] = sale_cache
     state["processed_steam_sales"] = processed_order[-STEAM_FINANCE_STATE_MAX_PROCESSED:]
+    state["seen_event_keys"] = seen_order[-STEAM_FINANCE_STATE_MAX_EVENT_KEYS:]
     if history_ok:
         state["last_sync_at"] = now.isoformat(timespec="seconds")
     _save_steam_finance_state(state)
