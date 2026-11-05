@@ -18,7 +18,12 @@ from aiosteampy.helpers import restore_from_cookies
 from aiosteampy.mixins.guard import SteamGuardMixin
 from aiosteampy.mixins.web_api import SteamWebApiMixin
 from aiosteampy.models import ItemDescription, EconItem, BaseTradeOfferItem
-from aiosteampy.constants import TradeOfferStatus, TRADABLE_AFTER_DATE_FORMAT
+from aiosteampy.constants import (
+    Currency,
+    MarketHistoryEventType,
+    TradeOfferStatus,
+    TRADABLE_AFTER_DATE_FORMAT,
+)
 from aiosteampy.exceptions import SessionExpired
 
 
@@ -143,6 +148,16 @@ SELLER_SYNC_BATCH_SIZE = 5
 SELLER_SYNC_TRANSIENT_RETRY_SEC = 15 * 60      # повтор проверки pending при транзиентной ошибке
 SELLER_SYNC_ERROR_RETRY_SEC = 12 * 60 * 60     # повтор при постоянной (нетранзиентной) ошибке
 PROCESSED_TRADES_TTL_DAYS = 30                 # сколько хранить обработанные трейды
+CSFLOAT_SELL_FEE_PERCENT = 2.0                 # комиссия CSFloat при продаже
+
+# Статистика по Steam: проверка баланса и истории рынка раз в N циклов
+STEAM_FINANCE_SYNC_EVERY_N_CYCLES = 3
+STEAM_MARKET_HISTORY_PAGE_SIZE = 100
+STEAM_MARKET_HISTORY_INITIAL_MAX_PAGES = 30
+STEAM_MARKET_HISTORY_INCREMENTAL_MAX_PAGES = 5
+STEAM_HISTORY_LOOKBACK_DAYS = 365
+STEAM_SALE_REPORT_WINDOW_DAYS = 14
+STEAM_FINANCE_STATE_MAX_PROCESSED = 5000
 
 API_USER_INFO = "https://csfloat.com/api/v1/me"
 API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"
@@ -155,6 +170,7 @@ BUYER_PURCHASES_LOG_FILE = Path("buyer_purchases_log.json")
 TG_CONFIG_FILE = Path("tg.json")
 STEAM_BACKOFF_FILE = Path("steam_rate_limit.json")
 STEAM_AUTH_BACKOFF_FILE = Path("steam_auth_backoff.json")
+STEAM_FINANCE_STATE_FILE = Path("steam_finance_state.json")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -462,6 +478,251 @@ def load_seller_pending_by_trade_id() -> dict[str, dict]:
 
 
 # =============================================================================
+# СТАТИСТИКА STEAM: БАЛАНС, ИСТОРИЯ РЫНКА, ПРОЦЕНТЫ ВЫВОДА/ЗАВОЗА
+# =============================================================================
+
+def _parse_price_text(price_text: str):
+    if not price_text:
+        return None, None
+    match = re.match(r"^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{2,})?", str(price_text))
+    if not match:
+        return None, None
+    try:
+        amount = float(match.group(1).replace(",", "."))
+    except ValueError:
+        return None, None
+    currency = (match.group(2) or "").upper() or None
+    return amount, currency
+
+
+def _load_steam_finance_state() -> dict:
+    if STEAM_FINANCE_STATE_FILE.is_file():
+        try:
+            with STEAM_FINANCE_STATE_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if not isinstance(data.get("purchases"), dict):
+                    data["purchases"] = {}
+                if not isinstance(data.get("reported_withdrawals"), dict):
+                    data["reported_withdrawals"] = {}
+                if not isinstance(data.get("processed_steam_sales"), list):
+                    data["processed_steam_sales"] = []
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"purchases": {}, "reported_withdrawals": {}, "processed_steam_sales": []}
+
+
+def _save_steam_finance_state(state: dict):
+    _atomic_write_json(STEAM_FINANCE_STATE_FILE, state, ensure_ascii=False)
+
+
+def _steam_sale_event_key(event) -> str:
+    return f"{event.listing.id}:{int(event.time_event.timestamp())}"
+
+
+def _find_csfloat_purchase_for_sale(purchases: list[dict], item_name: str):
+    for entry in purchases:
+        if (
+            isinstance(entry, dict)
+            and entry.get("item_name") == item_name
+            and not entry.get("steam_sale_reported_at")
+        ):
+            return entry
+    return None
+
+
+async def report_csfloat_withdrawal(trade_id, item_name, sale_price_text, asset_id):
+    state = _load_steam_finance_state()
+    trade_key = str(trade_id)
+    reported = state.setdefault("reported_withdrawals", {})
+    if trade_key in reported:
+        return
+
+    purchase = state.get("purchases", {}).get(str(asset_id)) if asset_id is not None else None
+    amount, sale_currency = _parse_price_text(sale_price_text)
+    lines = [f"CSFloat sale: {item_name}", f"Trade: {trade_id}"]
+
+    if purchase:
+        steam_paid = int(purchase.get("paid") or 0) / 100
+        steam_currency = (purchase.get("currency") or "USD").upper()
+        lines.append(f"Steam purchase: {steam_paid:.2f} {steam_currency}")
+        if amount is not None:
+            net = amount * (1 - CSFLOAT_SELL_FEE_PERCENT / 100)
+            fee_currency = sale_currency or steam_currency
+            lines.append(
+                f"CSFloat sale: {amount:.2f} {fee_currency} "
+                f"(after {CSFLOAT_SELL_FEE_PERCENT:g}% fee: {net:.2f} {fee_currency})"
+            )
+            if (sale_currency or steam_currency) == steam_currency and steam_paid > 0:
+                percent = (net / steam_paid - 1) * 100
+                lines.append(f"Withdrawal from Steam: {percent:+.1f}%")
+            else:
+                lines.append("Withdrawal from Steam: n/a (currency mismatch)")
+        else:
+            lines.append(f"CSFloat sale: {sale_price_text}")
+    else:
+        lines.append(f"CSFloat sale: {sale_price_text}")
+        lines.append("Steam purchase price not found in Steam market history")
+
+    await send_telegram_notification("\n".join(lines))
+    reported[trade_key] = {
+        "item_name": item_name,
+        "sale_price": sale_price_text,
+        "asset_id": str(asset_id) if asset_id is not None else None,
+        "reported_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_steam_finance_state(state)
+
+
+async def sync_steam_finance(client: SteamClient):
+    state = _load_steam_finance_state()
+    try:
+        wallet = await steam_api_call(lambda: client.get_wallet_info(), client=client)
+    except Exception as e:
+        logger.warning(f"Steam finance: wallet info unavailable: {e}")
+        return
+    try:
+        balance = int(wallet.get("wallet_balance"))
+        wallet_currency = Currency(int(wallet.get("wallet_currency"))).name
+    except (TypeError, ValueError, KeyError):
+        logger.warning("Steam finance: unexpected wallet info format")
+        return
+
+    old_balance = state.get("wallet_balance")
+    try:
+        balance_changed = old_balance is not None and balance != int(old_balance)
+    except (TypeError, ValueError):
+        balance_changed = False
+
+    try:
+        last_sync = datetime.fromisoformat(state.get("last_sync_at", ""))
+    except (TypeError, ValueError):
+        last_sync = None
+
+    now = datetime.now()
+    max_pages = (
+        STEAM_MARKET_HISTORY_INITIAL_MAX_PAGES if last_sync is None
+        else STEAM_MARKET_HISTORY_INCREMENTAL_MAX_PAGES
+    )
+    stop_before = now - timedelta(days=STEAM_HISTORY_LOOKBACK_DAYS)
+    if last_sync is not None:
+        stop_before = max(stop_before, last_sync - timedelta(days=1))
+
+    events = []
+    history_ok = False
+    for page in range(max_pages):
+        start = page * STEAM_MARKET_HISTORY_PAGE_SIZE
+        try:
+            page_events, _ = await steam_api_call(
+                lambda s=start: client.get_my_market_history(
+                    start=s, count=STEAM_MARKET_HISTORY_PAGE_SIZE
+                ),
+                client=client,
+            )
+        except Exception as e:
+            logger.warning(f"Steam finance: market history page {page} failed: {e}")
+            break
+        history_ok = True
+        events.extend(page_events)
+        if len(page_events) < STEAM_MARKET_HISTORY_PAGE_SIZE:
+            break
+        page_oldest = min((e.time_event for e in page_events), default=None)
+        if page_oldest is not None and page_oldest < stop_before:
+            break
+
+    purchases = state.get("purchases", {})
+    sale_events = []
+    for event in events:
+        listing = event.listing
+        description = getattr(listing.item, "description", None)
+        item_name = getattr(description, "market_hash_name", None) or "unknown item"
+        if event.type == MarketHistoryEventType.LISTING_PURCHASED:
+            new_asset_id = getattr(listing.item, "new_asset_id", None)
+            if new_asset_id is None:
+                continue
+            purchases[str(new_asset_id)] = {
+                "name": item_name,
+                "paid": int(listing.paid_amount or 0),
+                "currency": listing.currency.name if listing.currency else wallet_currency,
+                "time": (listing.time_sold or event.time_event).isoformat(timespec="seconds"),
+            }
+        elif event.type == MarketHistoryEventType.LISTING_SOLD:
+            sale_events.append(event)
+
+    processed_order = [str(key) for key in state.get("processed_steam_sales", [])]
+    processed = set(processed_order)
+
+    def mark_sale_processed(key):
+        if key in processed:
+            return
+        processed.add(key)
+        processed_order.append(key)
+
+    if balance_changed and history_ok:
+        purchases_log = load_buyer_purchases_log()
+        cutoff = now - timedelta(days=STEAM_SALE_REPORT_WINDOW_DAYS)
+        for event in sorted(sale_events, key=lambda e: e.time_event):
+            key = _steam_sale_event_key(event)
+            if key in processed:
+                continue
+            if event.time_event < cutoff:
+                mark_sale_processed(key)
+                continue
+            listing = event.listing
+            description = getattr(listing.item, "description", None)
+            item_name = getattr(description, "market_hash_name", None) or "unknown item"
+            gross = int(listing.price or 0)
+            fee = int(listing.fee or 0)
+            net = max(0, gross - fee)
+            sale_currency = listing.currency.name if listing.currency else wallet_currency
+            matched = _find_csfloat_purchase_for_sale(purchases_log, item_name)
+            lines = [
+                f"Steam market sale: {item_name}",
+                f"Sold for: {gross / 100:.2f} {sale_currency}",
+                f"Steam net: {net / 100:.2f} {sale_currency}",
+            ]
+            update = None
+            if matched:
+                cost_amount, cost_currency = _parse_price_text(matched.get("sale_price"))
+                if cost_amount is not None:
+                    cost_line = f"Bought on CSFloat: {cost_amount:.2f} {cost_currency or ''}".rstrip()
+                    lines.append(cost_line)
+                    if (cost_currency or sale_currency) == sale_currency and cost_amount > 0:
+                        percent = (net / 100) / cost_amount * 100
+                        lines.append(f"Deposit into Steam: {percent:+.1f}% net")
+                    else:
+                        lines.append("Deposit into Steam: n/a (currency mismatch)")
+                else:
+                    lines.append(f"Bought on CSFloat: {matched.get('sale_price')}")
+                update = {
+                    "steam_sale_reported_at": now.isoformat(timespec="seconds"),
+                    "steam_sale_net": net,
+                    "steam_sale_currency": sale_currency,
+                }
+            else:
+                lines.append("Bought on CSFloat: not found in purchase log")
+            await send_telegram_notification("\n".join(lines))
+            if update and matched:
+                matched.update(update)
+                upsert_buyer_purchase(matched)
+            mark_sale_processed(key)
+
+    state["wallet_balance"] = balance
+    state["wallet_currency"] = wallet_currency
+    state["purchases"] = purchases
+    state["processed_steam_sales"] = processed_order[-STEAM_FINANCE_STATE_MAX_PROCESSED:]
+    if history_ok:
+        state["last_sync_at"] = now.isoformat(timespec="seconds")
+    _save_steam_finance_state(state)
+    logger.info(
+        f"Steam finance synced: balance={balance / 100:.2f} {wallet_currency}, "
+        f"indexed purchases={len(purchases)}, wallet_changed={balance_changed}"
+    )
+
+
+
+# =============================================================================
 # ПОИСК УЖЕ ОТПРАВЛЕННЫХ STEAM-ОФФЕРОВ
 # =============================================================================
 
@@ -638,6 +899,10 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
         hist_id, hist_status = await _find_recent_historical_sent_accepted_for_asset(cache, buyer_id, asset_id_int)
         if hist_id is not None:
             upsert_seller_pending_verification({**base_update, "steam_offer_id": hist_id, "steam_offer_status": hist_status.name if hist_status else "ACCEPTED", "note": "Покупатель принял (или эскроу)"})
+            try:
+                await report_csfloat_withdrawal(trade_id, item_name, sale_price, asset_id_int)
+            except Exception as e:
+                logger.warning(f"Withdrawal report failed for trade {trade_id}: {e}")
             return True
         upsert_seller_pending_verification({**base_update, "sync_error": None, "sync_error_transient": None, "note": "Оффер не найден"})
         return True
@@ -656,6 +921,10 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
         return True
     if st in (TradeOfferStatus.ACCEPTED, TradeOfferStatus.STATE_IN_ESCROW):
         upsert_seller_pending_verification({**base_update, "steam_offer_id": steam_oid, "steam_offer_status": st.name, "note": "Принят / эскроу"})
+        try:
+            await report_csfloat_withdrawal(trade_id, item_name, sale_price, asset_id_int)
+        except Exception as e:
+            logger.warning(f"Withdrawal report failed for trade {trade_id}: {e}")
         return True
     if st in (TradeOfferStatus.DECLINED, TradeOfferStatus.CANCELED, TradeOfferStatus.EXPIRED, TradeOfferStatus.INVALID, TradeOfferStatus.INVALID_ITEMS, TradeOfferStatus.CANCELED_BY_SECONDARY_FACTOR):
         upsert_seller_pending_verification({**base_update, "steam_offer_id": None, "steam_offer_status": st.name, "note": f"Завершён: {st.name}"})
@@ -1045,6 +1314,15 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
         trade_state = trade.get('state')
 
         if trade_state == "verified":
+            try:
+                is_our_sale = int(seller_id) == my_steam_id64 and int(buyer_id) != my_steam_id64
+            except (TypeError, ValueError):
+                is_our_sale = False
+            if is_our_sale:
+                try:
+                    await report_csfloat_withdrawal(trade_id, item_name, sale_price, asset_id)
+                except Exception as e:
+                    logger.warning(f"Withdrawal report failed for trade {trade_id}: {e}")
             _mark_processed(processed_trades, trade_id)
             remove_seller_pending_verification(trade_id)
             continue
@@ -1270,14 +1548,26 @@ async def main():
 
     await send_telegram_notification(f"Auto - Trade bot Started")
 
+    try:
+        await sync_steam_finance(client)
+    except Exception as e:
+        logger.warning(f"Initial Steam finance sync failed: {e}")
+
     async with aiohttp.ClientSession() as session:
+        cycle = 0
         try:
             while True:
+                cycle += 1
                 try:
                     await check_actionable_trades(session, csfloat_api_key, client, processed_trades)
                     save_processed_trades(processed_trades)
                 except Exception as e:
                     logger.error(f"Trade pass failed; bot will retry after {CHECK_INTERVAL_MINUTES} min: {e}")
+                if cycle % STEAM_FINANCE_SYNC_EVERY_N_CYCLES == 0:
+                    try:
+                        await sync_steam_finance(client)
+                    except Exception as e:
+                        logger.warning(f"Steam finance sync failed: {e}")
                 await asyncio.sleep(with_jitter(CHECK_INTERVAL_MINUTES * 60))
         finally:
             _save_steam_cookies(client)
