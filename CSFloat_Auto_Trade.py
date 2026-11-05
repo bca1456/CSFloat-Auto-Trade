@@ -606,6 +606,40 @@ def _find_csfloat_purchase_for_sale(purchases: list[dict], item_name: str):
     return None
 
 
+def _steam_purchase_report_lines(sale_price_text, asset_id):
+    state = _load_steam_finance_state()
+    purchase = state.get("purchases", {}).get(str(asset_id)) if asset_id is not None else None
+    if not purchase:
+        return None, state
+    amount, sale_currency = _parse_price_text(sale_price_text)
+    steam_paid = int(purchase.get("paid") or 0) / 100
+    steam_currency = (purchase.get("currency") or "USD").upper()
+    lines = [f"Steam purchase: {steam_paid:.2f} {steam_currency}"]
+    if amount is not None:
+        net = amount * (1 - CSFLOAT_SELL_FEE_PERCENT / 100)
+        fee_currency = sale_currency or steam_currency
+        lines.append(
+            f"CSFloat net after {CSFLOAT_SELL_FEE_PERCENT:g}% fee: {net:.2f} {fee_currency}"
+        )
+        if (sale_currency or steam_currency) == steam_currency and steam_paid > 0:
+            percent = (net / steam_paid - 1) * 100
+            lines.append(f"Withdrawal from Steam: {percent:+.1f}%")
+        else:
+            lines.append("Withdrawal from Steam: n/a (currency mismatch)")
+    return lines, state
+
+
+def _mark_withdrawal_reported(state, trade_id, item_name, sale_price_text, asset_id):
+    reported = state.setdefault("reported_withdrawals", {})
+    reported[str(trade_id)] = {
+        "item_name": item_name,
+        "sale_price": sale_price_text,
+        "asset_id": str(asset_id) if asset_id is not None else None,
+        "reported_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_steam_finance_state(state)
+
+
 async def report_csfloat_withdrawal(trade_id, item_name, sale_price_text, asset_id, sale_time=None):
     state = _load_steam_finance_state()
     trade_key = str(trade_id)
@@ -1577,7 +1611,18 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 send_success = True
                 sent_offer_id = int(offer_id)
                 logger.info(f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}.")
-                await send_telegram_notification(f"CSFloat sale sent\nTrade: {trade_id}\nItem: {item_name}\nPrice: {sale_price}")
+                message_lines = [
+                    "CSFloat sale sent",
+                    f"Trade: {trade_id}",
+                    f"Item: {item_name}",
+                    f"Price: {sale_price}",
+                ]
+                details, finance_state = _steam_purchase_report_lines(sale_price, asset_id)
+                if details:
+                    message_lines.extend(details)
+                await send_telegram_notification("\n".join(message_lines))
+                if details:
+                    _mark_withdrawal_reported(finance_state, trade_id, item_name, sale_price, asset_id)
             else:
                 try:
                     existing_offer_id, _ = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id))
