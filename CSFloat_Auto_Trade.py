@@ -553,6 +553,37 @@ def _migrate_steam_finance_state(state: dict):
     state["cache_version"] = STEAM_FINANCE_CACHE_VERSION
 
 
+def _parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def ensure_reporting_baseline():
+    state = _load_steam_finance_state()
+    if state.get("reporting_since"):
+        return
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    reported = state.setdefault("reported_withdrawals", {})
+    for entry in load_seller_pending_verification_log():
+        if not isinstance(entry, dict):
+            continue
+        trade_id = entry.get("trade_id")
+        if trade_id is not None:
+            reported.setdefault(str(trade_id), {
+                "seeded": True,
+                "reported_at": now_iso,
+            })
+    state["reporting_since"] = now_iso
+    _save_steam_finance_state(state)
+
+
 def _steam_event_key(event) -> str:
     if event.type == MarketHistoryEventType.LISTING_PURCHASED:
         new_asset_id = getattr(event.listing.item, "new_asset_id", None)
@@ -575,11 +606,23 @@ def _find_csfloat_purchase_for_sale(purchases: list[dict], item_name: str):
     return None
 
 
-async def report_csfloat_withdrawal(trade_id, item_name, sale_price_text, asset_id):
+async def report_csfloat_withdrawal(trade_id, item_name, sale_price_text, asset_id, sale_time=None):
     state = _load_steam_finance_state()
     trade_key = str(trade_id)
     reported = state.setdefault("reported_withdrawals", {})
     if trade_key in reported:
+        return
+
+    baseline = _parse_iso_datetime(state.get("reporting_since"))
+    if sale_time is not None and baseline is not None and sale_time < baseline:
+        reported[trade_key] = {
+            "item_name": item_name,
+            "sale_price": sale_price_text,
+            "asset_id": str(asset_id) if asset_id is not None else None,
+            "skipped": "older than reporting baseline",
+            "reported_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _save_steam_finance_state(state)
         return
 
     purchase = state.get("purchases", {}).get(str(asset_id)) if asset_id is not None else None
@@ -748,6 +791,7 @@ async def sync_steam_finance(client: SteamClient):
     if balance_changed and history_ok:
         purchases_log = load_buyer_purchases_log()
         cutoff = now - timedelta(days=STEAM_SALE_REPORT_WINDOW_DAYS)
+        baseline = _parse_iso_datetime(state.get("reporting_since"))
         pending_sales = []
         for key, sale in sale_cache.items():
             if key in processed:
@@ -757,7 +801,7 @@ async def sync_steam_finance(client: SteamClient):
             except (TypeError, ValueError):
                 mark_sale_processed(key)
                 continue
-            if event_time < cutoff:
+            if event_time < cutoff or (baseline is not None and event_time < baseline):
                 mark_sale_processed(key)
                 continue
             pending_sales.append((event_time, key, sale))
@@ -993,7 +1037,10 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
         if hist_id is not None:
             upsert_seller_pending_verification({**base_update, "steam_offer_id": hist_id, "steam_offer_status": hist_status.name if hist_status else "ACCEPTED", "note": "Покупатель принял (или эскроу)"})
             try:
-                await report_csfloat_withdrawal(trade_id, item_name, sale_price, asset_id_int)
+                await report_csfloat_withdrawal(
+                    trade_id, item_name, sale_price, asset_id_int,
+                    sale_time=_parse_iso_datetime(entry.get("sent_at")),
+                )
             except Exception as e:
                 logger.warning(f"Withdrawal report failed for trade {trade_id}: {e}")
             return True
@@ -1015,7 +1062,10 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
     if st in (TradeOfferStatus.ACCEPTED, TradeOfferStatus.STATE_IN_ESCROW):
         upsert_seller_pending_verification({**base_update, "steam_offer_id": steam_oid, "steam_offer_status": st.name, "note": "Принят / эскроу"})
         try:
-            await report_csfloat_withdrawal(trade_id, item_name, sale_price, asset_id_int)
+            await report_csfloat_withdrawal(
+                trade_id, item_name, sale_price, asset_id_int,
+                sale_time=_parse_iso_datetime(entry.get("sent_at")),
+            )
         except Exception as e:
             logger.warning(f"Withdrawal report failed for trade {trade_id}: {e}")
         return True
@@ -1413,7 +1463,12 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 is_our_sale = False
             if is_our_sale:
                 try:
-                    await report_csfloat_withdrawal(trade_id, item_name, sale_price, asset_id)
+                    sale_time = _parse_iso_datetime(
+                        trade.get("accepted_at") or trade.get("created_at")
+                    )
+                    await report_csfloat_withdrawal(
+                        trade_id, item_name, sale_price, asset_id, sale_time=sale_time
+                    )
                 except Exception as e:
                     logger.warning(f"Withdrawal report failed for trade {trade_id}: {e}")
             _mark_processed(processed_trades, trade_id)
@@ -1494,6 +1549,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 "csfloat_state": trade_state or "unknown",
                 "steam_offer_status": existing_offer_status.name,
                 "last_checked_at": datetime.now().isoformat(timespec="seconds"),
+                "sent_at": datetime.now().isoformat(timespec="seconds"),
                 "note": "Оффер уже отправлялся ранее; ждём verified на CSFloat",
             })
         else:
@@ -1638,6 +1694,8 @@ async def main():
     await _startup_login(client)
 
     processed_trades = load_processed_trades()
+
+    ensure_reporting_baseline()
 
     await send_telegram_notification(f"Auto - Trade bot Started")
 
