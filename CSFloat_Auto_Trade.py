@@ -858,7 +858,7 @@ async def sync_steam_finance(client: SteamClient):
                     cost_line = f"Bought on CSFloat: {cost_amount:.2f} {cost_currency or ''}".rstrip()
                     lines.append(cost_line)
                     if (cost_currency or net_currency) == net_currency and cost_amount > 0:
-                        percent = (net / 100) / cost_amount * 100
+                        percent = ((net / 100) / cost_amount - 1) * 100
                         lines.append(f"Deposit into Steam: {percent:+.1f}% net")
                     else:
                         lines.append("Deposit into Steam: n/a (currency mismatch)")
