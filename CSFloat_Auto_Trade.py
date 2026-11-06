@@ -9,6 +9,7 @@ import sys
 import time
 import aiohttp
 from pathlib import Path
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, parse_qs
@@ -22,6 +23,7 @@ from aiosteampy.models import ItemDescription, EconItem, BaseTradeOfferItem
 from aiosteampy.constants import (
     Currency,
     MarketHistoryEventType,
+    STEAM_URL,
     TradeOfferStatus,
     TRADABLE_AFTER_DATE_FORMAT,
 )
@@ -162,6 +164,13 @@ STEAM_SALE_REPORT_WINDOW_DAYS = 14
 STEAM_FINANCE_STATE_MAX_PROCESSED = 5000
 STEAM_FINANCE_STATE_MAX_EVENT_KEYS = 20000
 STEAM_FINANCE_CACHE_VERSION = 2
+FINANCE_LEDGER_TTL_DAYS = 400
+
+# Периодические отчёты
+WEEKLY_REPORT_WEEKDAY = 6
+MONTHLY_REPORT_DAY = 30
+MONTHLY_REPORT_FEB_DAY = 28
+REPORT_HOUR = 18
 
 API_USER_INFO = "https://csfloat.com/api/v1/me"
 API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"
@@ -540,6 +549,8 @@ def _load_steam_finance_state() -> dict:
                     data["seen_event_keys"] = []
                 if not isinstance(data.get("sale_events"), dict):
                     data["sale_events"] = {}
+                if not isinstance(data.get("finance_ledger"), list):
+                    data["finance_ledger"] = []
                 return data
         except (OSError, json.JSONDecodeError):
             pass
@@ -549,6 +560,7 @@ def _load_steam_finance_state() -> dict:
         "processed_steam_sales": [],
         "seen_event_keys": [],
         "sale_events": {},
+        "finance_ledger": [],
     }
 
 
@@ -659,7 +671,316 @@ def _steam_purchase_report_lines(sale_price_text, asset_id):
     return lines, state
 
 
-def _mark_withdrawal_reported(state, trade_id, item_name, sale_price_text, asset_id):
+def _append_finance_ledger(state, entry):
+    ledger = state.setdefault("finance_ledger", [])
+    reference = entry.get("reference")
+    entry_type = entry.get("type")
+    if reference is not None:
+        for existing in ledger:
+            if (
+                isinstance(existing, dict)
+                and existing.get("type") == entry_type
+                and str(existing.get("reference")) == str(reference)
+            ):
+                if entry.get("cost") is not None and existing.get("cost") is None:
+                    existing["cost"] = entry["cost"]
+                    existing["cost_currency"] = entry.get("cost_currency")
+                if (
+                    entry.get("item_name")
+                    and existing.get("item_name") in (None, "unknown item")
+                ):
+                    existing["item_name"] = entry["item_name"]
+                return
+    ledger.append(entry)
+
+
+def _record_withdrawal_ledger(state, trade_id, item_name, sale_price_text, asset_id, event_time=None):
+    purchase = state.get("purchases", {}).get(str(asset_id)) if asset_id is not None else None
+    amount, sale_currency = _parse_price_text(sale_price_text)
+    if not purchase or amount is None:
+        return
+    steam_paid = int(purchase.get("paid") or 0) / 100
+    if steam_paid <= 0:
+        return
+    steam_currency = (purchase.get("currency") or "USD").upper()
+    sale_currency = sale_currency or steam_currency
+    net = amount * (1 - CSFLOAT_SELL_FEE_PERCENT / 100)
+    when = event_time or datetime.now()
+    _append_finance_ledger(state, {
+        "type": "withdrawal",
+        "reference": str(trade_id),
+        "time": when.isoformat(timespec="seconds"),
+        "item_name": item_name,
+        "amount": round(net, 4),
+        "currency": sale_currency,
+        "cost": round(steam_paid, 4),
+        "cost_currency": steam_currency,
+    })
+
+
+def _record_deposit_ledger(state, reference, item_name, net_amount, net_currency,
+                           cost_amount=None, cost_currency=None, event_time=None):
+    if net_amount is None or net_amount <= 0:
+        return
+    when = event_time or datetime.now()
+    entry = {
+        "type": "deposit",
+        "reference": str(reference),
+        "time": when.isoformat(timespec="seconds"),
+        "item_name": item_name,
+        "amount": round(float(net_amount), 4),
+        "currency": (net_currency or "").upper() or None,
+    }
+    if cost_amount is not None and cost_amount > 0:
+        entry["cost"] = round(float(cost_amount), 4)
+        entry["cost_currency"] = (cost_currency or "").upper() or None
+    _append_finance_ledger(state, entry)
+
+
+def _prune_finance_ledger(state, now=None):
+    cutoff = (now or datetime.now()) - timedelta(days=FINANCE_LEDGER_TTL_DAYS)
+    kept = []
+    for entry in state.get("finance_ledger", []):
+        if not isinstance(entry, dict):
+            continue
+        event_time = _parse_iso_datetime(entry.get("time"))
+        if event_time is None or event_time >= cutoff:
+            kept.append(entry)
+    state["finance_ledger"] = kept
+
+
+def _backfill_finance_ledger(state):
+    if state.get("ledger_backfilled"):
+        return
+    now = datetime.now()
+
+    for trade_id, entry in (state.get("reported_withdrawals") or {}).items():
+        if not isinstance(entry, dict) or entry.get("skipped"):
+            continue
+        when = _parse_iso_datetime(entry.get("reported_at")) or now
+        _record_withdrawal_ledger(
+            state, trade_id, entry.get("item_name"), entry.get("sale_price"),
+            entry.get("asset_id"), when,
+        )
+
+    for entry in load_seller_pending_verification_log():
+        if (
+            not isinstance(entry, dict)
+            or entry.get("steam_offer_status") not in ("ACCEPTED", "STATE_IN_ESCROW")
+        ):
+            continue
+        when = (
+            _parse_iso_datetime(entry.get("sent_at"))
+            or _parse_iso_datetime(entry.get("last_checked_at"))
+            or now
+        )
+        _record_withdrawal_ledger(
+            state, entry.get("trade_id"), entry.get("item_name"),
+            entry.get("sale_price"), entry.get("asset_id"), when,
+        )
+
+    for key, sale in (state.get("sale_events") or {}).items():
+        if not isinstance(sale, dict):
+            continue
+        try:
+            net = int(sale.get("net") or 0) / 100
+        except (TypeError, ValueError):
+            continue
+        when = _parse_iso_datetime(sale.get("time"))
+        if net <= 0 or when is None:
+            continue
+        _record_deposit_ledger(
+            state,
+            f"deposit:{key}",
+            sale.get("item_name"),
+            net,
+            sale.get("net_currency") or "USD",
+            None,
+            None,
+            when,
+        )
+
+    state["ledger_backfilled"] = True
+
+
+def ensure_finance_ledger():
+    state = _load_steam_finance_state()
+    _backfill_finance_ledger(state)
+    _prune_finance_ledger(state)
+    _save_steam_finance_state(state)
+
+
+def _monthly_day(year, month):
+    return MONTHLY_REPORT_FEB_DAY if month == 2 else MONTHLY_REPORT_DAY
+
+
+def _scheduled_weekly_time(now):
+    days_since = (now.weekday() - WEEKLY_REPORT_WEEKDAY) % 7
+    candidate = (now - timedelta(days=days_since)).replace(
+        hour=REPORT_HOUR, minute=0, second=0, microsecond=0
+    )
+    if candidate > now:
+        candidate -= timedelta(days=7)
+    return candidate
+
+
+def _scheduled_monthly_time(now):
+    candidate = now.replace(
+        day=_monthly_day(now.year, now.month),
+        hour=REPORT_HOUR, minute=0, second=0, microsecond=0,
+    )
+    if candidate > now:
+        first_day = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        previous = first_day - timedelta(days=1)
+        candidate = previous.replace(
+            day=_monthly_day(previous.year, previous.month),
+            hour=REPORT_HOUR, minute=0, second=0, microsecond=0,
+        )
+    return candidate
+
+
+def _next_monthly_time(dt):
+    if dt.month == 12:
+        year, month = dt.year + 1, 1
+    else:
+        year, month = dt.year, dt.month + 1
+    return datetime(year, month, _monthly_day(year, month), REPORT_HOUR, 0, 0)
+
+
+def _aggregate_finance_period(state, start, end, currency):
+    result = {
+        "deposit": {"amount": 0.0, "cost": 0.0, "matched_amount": 0.0, "count": 0, "matched": 0},
+        "withdrawal": {"amount": 0.0, "cost": 0.0, "matched_amount": 0.0, "count": 0, "matched": 0},
+    }
+    for entry in state.get("finance_ledger", []):
+        if not isinstance(entry, dict):
+            continue
+        event_time = _parse_iso_datetime(entry.get("time"))
+        if event_time is None or not (start <= event_time < end):
+            continue
+        entry_type = entry.get("type")
+        if entry_type not in result:
+            continue
+        if (entry.get("currency") or "").upper() != currency:
+            continue
+        try:
+            amount = float(entry.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        bucket = result[entry_type]
+        bucket["count"] += 1
+        bucket["amount"] += amount
+        cost = entry.get("cost")
+        if cost is None or (entry.get("cost_currency") or "").upper() != currency:
+            continue
+        try:
+            cost = float(cost)
+        except (TypeError, ValueError):
+            continue
+        if cost <= 0:
+            continue
+        bucket["cost"] += cost
+        bucket["matched_amount"] += amount
+        bucket["matched"] += 1
+    for bucket in result.values():
+        bucket["percent"] = (
+            (bucket["matched_amount"] / bucket["cost"] - 1) * 100
+            if bucket["cost"] > 0 else None
+        )
+    return result
+
+
+def _format_period_report(title, start, end, aggregates, currency):
+    currency = (currency or "USD").upper()
+    header = (
+        f"📊 <b>{_tg_escape(title)}</b>\n"
+        f"📅 {start:%d.%m.%Y %H:%M} — {end:%d.%m.%Y %H:%M}"
+    )
+
+    def build_section(emoji, label, data):
+        sold = data["matched_amount"] if data["cost"] > 0 else data["amount"]
+        lines = [f"{emoji} <b>{label}</b>"]
+        if data["cost"] > 0:
+            lines.append(f"Bought: {data['cost']:.2f} {currency}")
+        else:
+            lines.append("Bought: n/a")
+        lines.append(f"Sold: {sold:.2f} {currency}")
+        if data["percent"] is not None:
+            lines.append(f"Percent: {data['percent']:+.1f}%")
+        else:
+            lines.append("Percent: n/a")
+        lines.append(f"Transactions : {data['count']}")
+        if data["count"] > data["matched"]:
+            lines.append(f"Unmatched : {data['count'] - data['matched']}")
+        return "\n".join(lines)
+
+    return "\n\n\n".join([
+        header,
+        build_section("💰", "CSFloat -> Steam", aggregates["deposit"]),
+        build_section("💸", "Steam -> CSFloat", aggregates["withdrawal"]),
+    ])
+
+
+async def send_period_report(kind, start, end, state, title_prefix=""):
+    currency = (state.get("wallet_currency") or "USD").upper()
+    title = "Weekly report" if kind == "weekly" else "Monthly report"
+    if title_prefix:
+        title = f"{title_prefix} {title}"
+    aggregates = _aggregate_finance_period(state, start, end, currency)
+    text = _format_period_report(title, start, end, aggregates, currency)
+    return await send_telegram_notification(text, parse_mode="HTML")
+
+
+async def maybe_send_scheduled_reports():
+    state = _load_steam_finance_state()
+    now = datetime.now()
+    weekly_target = _scheduled_weekly_time(now)
+    monthly_target = _scheduled_monthly_time(now)
+    last_weekly = _parse_iso_datetime(state.get("last_weekly_report_end"))
+    last_monthly = _parse_iso_datetime(state.get("last_monthly_report_end"))
+
+    initialized = False
+    if last_weekly is None:
+        state["last_weekly_report_end"] = weekly_target.isoformat(timespec="seconds")
+        last_weekly = weekly_target
+        initialized = True
+    if last_monthly is None:
+        state["last_monthly_report_end"] = monthly_target.isoformat(timespec="seconds")
+        last_monthly = monthly_target
+        initialized = True
+    if initialized:
+        _save_steam_finance_state(state)
+
+    weekly_due = weekly_target > last_weekly
+    monthly_due = monthly_target > last_monthly
+    if not weekly_due and not monthly_due:
+        return
+
+    if weekly_due:
+        schedule = last_weekly + timedelta(days=7)
+        while schedule <= weekly_target:
+            ok = await send_period_report(
+                "weekly", schedule - timedelta(days=7), schedule, state
+            )
+            if not ok:
+                return
+            state["last_weekly_report_end"] = schedule.isoformat(timespec="seconds")
+            _save_steam_finance_state(state)
+            schedule += timedelta(days=7)
+
+    if monthly_due:
+        schedule = _next_monthly_time(last_monthly)
+        while schedule <= monthly_target:
+            ok = await send_period_report("monthly", last_monthly, schedule, state)
+            if not ok:
+                return
+            state["last_monthly_report_end"] = schedule.isoformat(timespec="seconds")
+            _save_steam_finance_state(state)
+            last_monthly = schedule
+            schedule = _next_monthly_time(schedule)
+
+
+def _mark_withdrawal_reported(state, trade_id, item_name, sale_price_text, asset_id, sale_time=None):
     reported = state.setdefault("reported_withdrawals", {})
     reported[str(trade_id)] = {
         "item_name": item_name,
@@ -667,6 +988,7 @@ def _mark_withdrawal_reported(state, trade_id, item_name, sale_price_text, asset
         "asset_id": str(asset_id) if asset_id is not None else None,
         "reported_at": datetime.now().isoformat(timespec="seconds"),
     }
+    _record_withdrawal_ledger(state, trade_id, item_name, sale_price_text, asset_id, sale_time)
     _save_steam_finance_state(state)
 
 
@@ -730,7 +1052,195 @@ async def report_csfloat_withdrawal(trade_id, item_name, sale_price_text, asset_
         "asset_id": str(asset_id) if asset_id is not None else None,
         "reported_at": datetime.now().isoformat(timespec="seconds"),
     }
+    _record_withdrawal_ledger(
+        state, trade_id, item_name, sale_price_text, asset_id, sale_time
+    )
     _save_steam_finance_state(state)
+
+
+async def _fetch_raw_market_history_page(client, start, count):
+    response = await client.session.get(
+        STEAM_URL.MARKET / "myhistory",
+        params={"norender": 1, "start": start, "count": count},
+    )
+    if response.status == 400:
+        raise SessionExpired("Steam session expired")
+    response.raise_for_status()
+    return await response.json()
+
+
+def _raw_history_event_key(event, purchases):
+    listing_id = str(event.get("listingid"))
+    time_event = int(event.get("time_event") or 0)
+    if int(event.get("event_type") or 0) == MarketHistoryEventType.LISTING_PURCHASED.value:
+        purchase = purchases.get(f"{listing_id}_{event.get('purchaseid')}")
+        if isinstance(purchase, dict):
+            new_id = (purchase.get("asset") or {}).get("new_id")
+            if new_id is not None:
+                return f"p:{new_id}:{time_event}"
+    return f"s:{listing_id}:{time_event}"
+
+
+def _currency_from_id(value):
+    try:
+        return Currency(int(value) - 2000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_raw_history_events(merged):
+    purchases = merged.get("purchases") or {}
+    listings = merged.get("listings") or {}
+
+    asset_names = {}
+    for app_data in (merged.get("assets") or {}).values():
+        for context_data in (app_data or {}).values():
+            for asset in (context_data or {}).values():
+                name = asset.get("market_hash_name") or asset.get("name")
+                if not name:
+                    continue
+                for key in ("id", "unowned_id", "new_id"):
+                    value = asset.get(key)
+                    if value is not None:
+                        asset_names[str(value)] = name
+
+    events = []
+    for raw_event in merged.get("events") or []:
+        try:
+            event_type = MarketHistoryEventType(int(raw_event.get("event_type")))
+        except (TypeError, ValueError):
+            continue
+        listing_id = str(raw_event.get("listingid"))
+        purchase_id = raw_event.get("purchaseid")
+        time_event = (
+            datetime.fromtimestamp(int(raw_event["time_event"]))
+            if raw_event.get("time_event") else None
+        )
+        if time_event is None:
+            continue
+
+        purchase = purchases.get(f"{listing_id}_{purchase_id}") if purchase_id else None
+        listing_data = listings.get(listing_id)
+
+        if isinstance(purchase, dict):
+            asset = purchase.get("asset") or {}
+            name = (
+                asset_names.get(str(asset.get("id")))
+                or asset_names.get(str(asset.get("new_id")))
+                or "unknown item"
+            )
+            item = SimpleNamespace(
+                description=SimpleNamespace(market_hash_name=name),
+                new_asset_id=int(asset["new_id"]) if asset.get("new_id") else None,
+                asset_id=int(asset["id"]) if asset.get("id") else None,
+            )
+            listing = SimpleNamespace(
+                id=int(listing_id),
+                item=item,
+                currency=_currency_from_id(purchase.get("currencyid")),
+                received_currency=_currency_from_id(purchase.get("received_currencyid")),
+                paid_amount=int(purchase.get("paid_amount") or 0),
+                paid_fee=int(purchase.get("paid_fee") or 0),
+                received_amount=(
+                    int(purchase["received_amount"])
+                    if purchase.get("received_amount") is not None else None
+                ),
+                time_sold=(
+                    datetime.fromtimestamp(int(purchase["time_sold"]))
+                    if purchase.get("time_sold") else time_event
+                ),
+                price=None,
+                fee=None,
+                original_price=None,
+            )
+        elif isinstance(listing_data, dict):
+            asset = listing_data.get("asset") or {}
+            name = asset_names.get(str(asset.get("id"))) or "unknown item"
+            item = SimpleNamespace(
+                description=SimpleNamespace(market_hash_name=name),
+                new_asset_id=None,
+                asset_id=int(asset["id"]) if asset.get("id") else None,
+            )
+            listing = SimpleNamespace(
+                id=int(listing_id),
+                item=item,
+                currency=_currency_from_id(listing_data.get("currencyid")),
+                received_currency=None,
+                paid_amount=None,
+                paid_fee=None,
+                received_amount=None,
+                time_sold=time_event,
+                price=int(listing_data.get("price") or 0),
+                fee=int(listing_data.get("fee") or 0),
+                original_price=int(listing_data.get("original_price") or 0),
+            )
+        else:
+            continue
+
+        events.append(SimpleNamespace(type=event_type, time_event=time_event, listing=listing))
+
+    return events
+
+
+async def _load_market_history_events(client, max_pages, state, last_sync, stop_before):
+    seen_order = [str(key) for key in state.get("seen_event_keys", [])]
+    seen = set(seen_order)
+    merged = {"assets": {}, "events": [], "listings": {}, "purchases": {}}
+    history_ok = False
+
+    for page in range(max_pages):
+        start = page * STEAM_MARKET_HISTORY_PAGE_SIZE
+        try:
+            data = await steam_api_call(
+                lambda s=start: _fetch_raw_market_history_page(
+                    client, s, STEAM_MARKET_HISTORY_PAGE_SIZE
+                ),
+                client=client,
+            )
+        except Exception as e:
+            logger.warning(f"Steam finance: market history page {page} failed: {e}")
+            break
+        history_ok = True
+
+        for app_id, app_data in (data.get("assets") or {}).items():
+            app_bucket = merged["assets"].setdefault(str(app_id), {})
+            for context_id, context_data in (app_data or {}).items():
+                context_bucket = app_bucket.setdefault(str(context_id), {})
+                for asset_id, asset in (context_data or {}).items():
+                    context_bucket[str(asset_id)] = asset
+
+        page_events = data.get("events") or []
+        merged["events"].extend(page_events)
+        merged["listings"].update(data.get("listings") or {})
+        merged["purchases"].update(data.get("purchases") or {})
+
+        page_keys = [_raw_history_event_key(event, merged["purchases"]) for event in page_events]
+        page_has_new = any(key not in seen for key in page_keys)
+        for key in page_keys:
+            if key not in seen:
+                seen.add(key)
+                seen_order.append(key)
+
+        if len(page_events) < STEAM_MARKET_HISTORY_PAGE_SIZE:
+            break
+        if last_sync is not None and not page_has_new:
+            break
+        page_oldest = min(
+            (
+                datetime.fromtimestamp(int(event["time_event"]))
+                for event in page_events
+                if event.get("time_event")
+            ),
+            default=None,
+        )
+        if page_oldest is not None and page_oldest < stop_before:
+            break
+
+    if not merged["events"]:
+        return seen_order, [], history_ok
+
+    events = _parse_raw_history_events(merged)
+    return seen_order, events, history_ok
 
 
 async def sync_steam_finance(client: SteamClient):
@@ -775,37 +1285,9 @@ async def sync_steam_finance(client: SteamClient):
     if last_sync is not None:
         stop_before = max(stop_before, last_sync - timedelta(days=1))
 
-    events = []
-    history_ok = False
-    seen_order = [str(key) for key in state.get("seen_event_keys", [])]
-    seen = set(seen_order)
-    for page in range(max_pages):
-        start = page * STEAM_MARKET_HISTORY_PAGE_SIZE
-        try:
-            page_events, _ = await steam_api_call(
-                lambda s=start: client.get_my_market_history(
-                    start=s, count=STEAM_MARKET_HISTORY_PAGE_SIZE
-                ),
-                client=client,
-            )
-        except Exception as e:
-            logger.warning(f"Steam finance: market history page {page} failed: {e}")
-            break
-        history_ok = True
-        events.extend(page_events)
-        page_keys = [_steam_event_key(event) for event in page_events]
-        page_has_new = any(key not in seen for key in page_keys)
-        for key in page_keys:
-            if key not in seen:
-                seen.add(key)
-                seen_order.append(key)
-        if len(page_events) < STEAM_MARKET_HISTORY_PAGE_SIZE:
-            break
-        if last_sync is not None and not page_has_new:
-            break
-        page_oldest = min((e.time_event for e in page_events), default=None)
-        if page_oldest is not None and page_oldest < stop_before:
-            break
+    seen_order, events, history_ok = await _load_market_history_events(
+        client, max_pages, state, last_sync, stop_before
+    )
 
     purchases = state.get("purchases", {})
     sale_cache = state.get("sale_events", {})
@@ -892,6 +1374,8 @@ async def sync_steam_finance(client: SteamClient):
             net = int(sale.get("net") or 0)
             net_currency = sale.get("net_currency") or wallet_currency
             matched = _find_csfloat_purchase_for_sale(purchases_log, item_name)
+            cost_amount = None
+            cost_currency = None
             lines = [
                 "📈 <b>Steam market sale</b>",
                 "",
@@ -921,6 +1405,17 @@ async def sync_steam_finance(client: SteamClient):
             else:
                 lines.append(_tg_field("🛍️ Bought on CSFloat", "not found in purchase log"))
             await send_telegram_notification("\n".join(lines), parse_mode="HTML")
+            deposit_reference = f"deposit:{key}"
+            _record_deposit_ledger(
+                state,
+                deposit_reference,
+                item_name,
+                net / 100,
+                net_currency,
+                cost_amount,
+                cost_currency,
+                _parse_iso_datetime(sale.get("time")) or now,
+            )
             if update and matched:
                 matched.update(update)
                 upsert_buyer_purchase(matched)
@@ -933,6 +1428,7 @@ async def sync_steam_finance(client: SteamClient):
     state["sale_events"] = sale_cache
     state["processed_steam_sales"] = processed_order[-STEAM_FINANCE_STATE_MAX_PROCESSED:]
     state["seen_event_keys"] = seen_order[-STEAM_FINANCE_STATE_MAX_EVENT_KEYS:]
+    _prune_finance_ledger(state, now)
     if history_ok:
         state["last_sync_at"] = now.isoformat(timespec="seconds")
     _save_steam_finance_state(state)
@@ -1675,7 +2171,12 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                     message_lines.extend(details)
                 await send_telegram_notification("\n".join(message_lines), parse_mode="HTML")
                 if details:
-                    _mark_withdrawal_reported(finance_state, trade_id, item_name, sale_price, asset_id)
+                    sale_time = _parse_iso_datetime(
+                        trade.get("accepted_at") or trade.get("created_at")
+                    )
+                    _mark_withdrawal_reported(
+                        finance_state, trade_id, item_name, sale_price, asset_id, sale_time
+                    )
             else:
                 try:
                     existing_offer_id, _ = await detect_existing_sent_offer_for_trade(client, bid, int(asset_id))
@@ -1804,6 +2305,13 @@ async def main():
     except Exception as e:
         logger.warning(f"Initial Steam finance sync failed: {e}")
 
+    ensure_finance_ledger()
+
+    try:
+        await maybe_send_scheduled_reports()
+    except Exception as e:
+        logger.warning(f"Scheduled reports check failed: {e}")
+
     async with aiohttp.ClientSession() as session:
         cycle = 0
         try:
@@ -1819,6 +2327,10 @@ async def main():
                         await sync_steam_finance(client)
                     except Exception as e:
                         logger.warning(f"Steam finance sync failed: {e}")
+                try:
+                    await maybe_send_scheduled_reports()
+                except Exception as e:
+                    logger.warning(f"Scheduled reports check failed: {e}")
                 await asyncio.sleep(max(
                     0,
                     CHECK_INTERVAL_MINUTES * 60
