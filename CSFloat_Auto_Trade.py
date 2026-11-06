@@ -11,7 +11,7 @@ import aiohttp
 from pathlib import Path
 from types import SimpleNamespace
 from datetime import datetime, timedelta
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from urllib.parse import urlparse, parse_qs
 
 from aiosteampy import SteamClient, AppContext
@@ -39,6 +39,83 @@ class SteamRateLimited(RuntimeError):
 # =============================================================================
 
 LOG_FILE = Path("csfloat_auto_trade.log")
+LOG_RETENTION_DAYS = 45
+
+_LOG_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+
+
+def _parse_log_line_time(line: str):
+    match = _LOG_TIMESTAMP_RE.match(line)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _prune_current_log(cutoff: datetime):
+    if not LOG_FILE.is_file():
+        return
+    try:
+        with LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+
+    kept = []
+    keep = True
+    for line in lines:
+        line_time = _parse_log_line_time(line)
+        if line_time is not None:
+            keep = line_time >= cutoff
+        if keep:
+            kept.append(line)
+
+    if len(kept) == len(lines):
+        return
+
+    tmp_path = LOG_FILE.with_name(LOG_FILE.name + ".prune.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            f.writelines(kept)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, LOG_FILE)
+    except OSError as e:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        print(f"Failed to prune log file: {e}", file=sys.stderr)
+
+
+def _prune_rotated_logs(cutoff: datetime):
+    if not LOG_FILE.parent.exists():
+        return
+    cutoff_date = cutoff.date()
+    for path in LOG_FILE.parent.glob(LOG_FILE.name + ".*"):
+        if not path.is_file():
+            continue
+        suffix = path.name[len(LOG_FILE.name) + 1:]
+        try:
+            file_date = datetime.strptime(suffix, "%Y-%m-%d").date()
+            remove = file_date < cutoff_date
+        except ValueError:
+            try:
+                remove = datetime.fromtimestamp(path.stat().st_mtime) < cutoff
+            except OSError:
+                continue
+        if remove:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def prune_old_logs():
+    cutoff = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
+    _prune_rotated_logs(cutoff)
 
 
 def setup_logging():
@@ -49,13 +126,18 @@ def setup_logging():
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
+    cutoff = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
+    _prune_current_log(cutoff)
+    _prune_rotated_logs(cutoff)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     root.addHandler(console)
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file_handler = TimedRotatingFileHandler(
+        LOG_FILE, when="midnight", interval=1, backupCount=0, encoding="utf-8"
+    )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
@@ -2331,6 +2413,10 @@ async def main():
                     await maybe_send_scheduled_reports()
                 except Exception as e:
                     logger.warning(f"Scheduled reports check failed: {e}")
+                try:
+                    prune_old_logs()
+                except Exception as e:
+                    logger.warning(f"Log cleanup failed: {e}")
                 await asyncio.sleep(max(
                     0,
                     CHECK_INTERVAL_MINUTES * 60
