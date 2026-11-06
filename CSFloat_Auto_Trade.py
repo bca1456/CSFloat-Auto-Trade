@@ -141,6 +141,7 @@ apply_aiosteampy_patches()
 # =============================================================================
 
 CHECK_INTERVAL_MINUTES = 30
+CHECK_INTERVAL_JITTER_SEC = 60
 STEAM_API_MIN_INTERVAL_SEC = 3
 STEAM_RATE_LIMIT_BACKOFF_SEC = 15 * 60
 SELLER_SYNC_INTERVAL_SEC = 6 * 60 * 60
@@ -1774,7 +1775,11 @@ async def main():
                         await sync_steam_finance(client)
                     except Exception as e:
                         logger.warning(f"Steam finance sync failed: {e}")
-                await asyncio.sleep(with_jitter(CHECK_INTERVAL_MINUTES * 60))
+                await asyncio.sleep(max(
+                    0,
+                    CHECK_INTERVAL_MINUTES * 60
+                    + random.uniform(-CHECK_INTERVAL_JITTER_SEC, CHECK_INTERVAL_JITTER_SEC),
+                ))
         finally:
             _save_steam_cookies(client)
             await client.session.close()
