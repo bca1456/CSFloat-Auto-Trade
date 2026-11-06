@@ -705,14 +705,21 @@ async def sync_steam_finance(client: SteamClient):
         return
     try:
         balance = int(wallet.get("wallet_balance"))
+        delayed_balance = int(wallet.get("wallet_delayed_balance") or 0)
         wallet_currency = Currency(int(wallet.get("wallet_currency"))).name
     except (TypeError, ValueError, KeyError):
         logger.warning("Steam finance: unexpected wallet info format")
         return
 
     old_balance = state.get("wallet_balance")
+    old_delayed_balance = state.get("wallet_delayed_balance")
     try:
-        balance_changed = old_balance is not None and balance != int(old_balance)
+        total_balance = balance + delayed_balance
+        old_total_balance = (
+            int(old_balance) + (int(old_delayed_balance) if old_delayed_balance is not None else 0)
+            if old_balance is not None else None
+        )
+        balance_changed = old_total_balance is not None and total_balance != old_total_balance
     except (TypeError, ValueError):
         balance_changed = False
 
@@ -878,6 +885,7 @@ async def sync_steam_finance(client: SteamClient):
             mark_sale_processed(key)
 
     state["wallet_balance"] = balance
+    state["wallet_delayed_balance"] = delayed_balance
     state["wallet_currency"] = wallet_currency
     state["purchases"] = purchases
     state["sale_events"] = sale_cache
@@ -888,6 +896,8 @@ async def sync_steam_finance(client: SteamClient):
     _save_steam_finance_state(state)
     logger.info(
         f"Steam finance synced: balance={balance / 100:.2f} {wallet_currency}, "
+        f"delayed={delayed_balance / 100:.2f} {wallet_currency}, "
+        f"total={total_balance / 100:.2f} {wallet_currency}, "
         f"indexed purchases={len(purchases)}, wallet_changed={balance_changed}"
     )
 
