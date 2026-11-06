@@ -151,7 +151,7 @@ PROCESSED_TRADES_TTL_DAYS = 30                 # сколько хранить �
 CSFLOAT_SELL_FEE_PERCENT = 2.0                 # комиссия CSFloat при продаже
 
 # Статистика по Steam: проверка баланса и истории рынка раз в N циклов
-STEAM_FINANCE_SYNC_EVERY_N_CYCLES = 3
+STEAM_FINANCE_SYNC_EVERY_N_CYCLES = 5
 STEAM_MARKET_HISTORY_PAGE_SIZE = 100
 STEAM_MARKET_HISTORY_INITIAL_MAX_PAGES = 30
 STEAM_MARKET_HISTORY_INCREMENTAL_MAX_PAGES = 5
