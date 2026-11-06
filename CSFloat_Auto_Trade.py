@@ -306,7 +306,7 @@ async def _reauthenticate(client) -> bool:
         if _steam_auth_failures >= MAX_STEAM_AUTH_FAILURES:
             _set_steam_auth_backoff()
             await send_telegram_notification(
-                "<b>Steam re-login failed</b>\n"
+                "⚠️ <b>Steam re-login failed</b>\n"
                 "All Steam actions paused for 1 hour to avoid account restrictions.\n"
                 "Check credentials / session manually.",
                 parse_mode="HTML",
@@ -641,21 +641,21 @@ def _steam_purchase_report_lines(sale_price_text, asset_id):
     amount, sale_currency = _parse_price_text(sale_price_text)
     steam_paid = int(purchase.get("paid") or 0) / 100
     steam_currency = (purchase.get("currency") or "USD").upper()
-    lines = [_tg_field("Steam purchase", f"{steam_paid:.2f} {steam_currency}")]
+    lines = [_tg_field("🛒 Steam purchase", f"{steam_paid:.2f} {steam_currency}")]
     if amount is not None:
         net = amount * (1 - CSFLOAT_SELL_FEE_PERCENT / 100)
         fee_currency = sale_currency or steam_currency
         lines.append(
             _tg_field(
-                f"CSFloat net after {CSFLOAT_SELL_FEE_PERCENT:g}% fee",
+                f"💰 CSFloat net after {CSFLOAT_SELL_FEE_PERCENT:g}% fee",
                 f"{net:.2f} {fee_currency}",
             )
         )
         if (sale_currency or steam_currency) == steam_currency and steam_paid > 0:
             percent = (net / steam_paid - 1) * 100
-            lines.append(_tg_field("Withdrawal from Steam", f"{percent:+.1f}%"))
+            lines.append(_tg_field("📉 Withdrawal from Steam", f"{percent:+.1f}%"))
         else:
-            lines.append(_tg_field("Withdrawal from Steam", "n/a (currency mismatch)"))
+            lines.append(_tg_field("📉 Withdrawal from Steam", "n/a (currency mismatch)"))
     return lines, state
 
 
@@ -692,36 +692,36 @@ async def report_csfloat_withdrawal(trade_id, item_name, sale_price_text, asset_
     purchase = state.get("purchases", {}).get(str(asset_id)) if asset_id is not None else None
     amount, sale_currency = _parse_price_text(sale_price_text)
     lines = [
-        "<b>CSFloat sale</b>",
+        "💸 <b>CSFloat sale</b>",
         "",
-        _tg_field("Item", item_name),
-        _tg_field("Trade", trade_id, mono=True),
+        _tg_field("📦 Item", item_name),
+        _tg_field("🔗 Trade", trade_id, mono=True),
     ]
 
     if purchase:
         steam_paid = int(purchase.get("paid") or 0) / 100
         steam_currency = (purchase.get("currency") or "USD").upper()
-        lines.append(_tg_field("Steam purchase", f"{steam_paid:.2f} {steam_currency}"))
+        lines.append(_tg_field("🛒 Steam purchase", f"{steam_paid:.2f} {steam_currency}"))
         if amount is not None:
             net = amount * (1 - CSFLOAT_SELL_FEE_PERCENT / 100)
             fee_currency = sale_currency or steam_currency
-            lines.append(_tg_field("Price", f"{amount:.2f} {fee_currency}"))
+            lines.append(_tg_field("🏷️ Price", f"{amount:.2f} {fee_currency}"))
             lines.append(
                 _tg_field(
-                    f"After {CSFLOAT_SELL_FEE_PERCENT:g}% fee",
+                    f"💰 After {CSFLOAT_SELL_FEE_PERCENT:g}% fee",
                     f"{net:.2f} {fee_currency}",
                 )
             )
             if (sale_currency or steam_currency) == steam_currency and steam_paid > 0:
                 percent = (net / steam_paid - 1) * 100
-                lines.append(_tg_field("Withdrawal from Steam", f"{percent:+.1f}%"))
+                lines.append(_tg_field("📉 Withdrawal from Steam", f"{percent:+.1f}%"))
             else:
-                lines.append(_tg_field("Withdrawal from Steam", "n/a (currency mismatch)"))
+                lines.append(_tg_field("📉 Withdrawal from Steam", "n/a (currency mismatch)"))
         else:
-            lines.append(_tg_field("Price", sale_price_text))
+            lines.append(_tg_field("🏷️ Price", sale_price_text))
     else:
-        lines.append(_tg_field("Price", sale_price_text))
-        lines.append("<i>Steam purchase price not found in Steam market history</i>")
+        lines.append(_tg_field("🏷️ Price", sale_price_text))
+        lines.append("❓ <i>Steam purchase price not found in Steam market history</i>")
 
     await send_telegram_notification("\n".join(lines), parse_mode="HTML")
     reported[trade_key] = {
@@ -893,33 +893,33 @@ async def sync_steam_finance(client: SteamClient):
             net_currency = sale.get("net_currency") or wallet_currency
             matched = _find_csfloat_purchase_for_sale(purchases_log, item_name)
             lines = [
-                "<b>Steam market sale</b>",
+                "📈 <b>Steam market sale</b>",
                 "",
-                _tg_field("Item", item_name),
+                _tg_field("📦 Item", item_name),
             ]
             if buyer_paid > 0 and buyer_currency == net_currency:
-                lines.append(_tg_field("Buyer paid", f"{buyer_paid / 100:.2f} {buyer_currency}"))
-            lines.append(_tg_field("Steam net", f"{net / 100:.2f} {net_currency}"))
+                lines.append(_tg_field("🛒 Buyer paid", f"{buyer_paid / 100:.2f} {buyer_currency}"))
+            lines.append(_tg_field("💰 Steam net", f"{net / 100:.2f} {net_currency}"))
             update = None
             if matched:
                 cost_amount, cost_currency = _parse_price_text(matched.get("sale_price"))
                 if cost_amount is not None:
                     cost_line = f"{cost_amount:.2f} {cost_currency or ''}".rstrip()
-                    lines.append(_tg_field("Bought on CSFloat", cost_line))
+                    lines.append(_tg_field("🛍️ Bought on CSFloat", cost_line))
                     if (cost_currency or net_currency) == net_currency and cost_amount > 0:
                         percent = ((net / 100) / cost_amount - 1) * 100
-                        lines.append(_tg_field("Deposit into Steam", f"{percent:+.1f}% net"))
+                        lines.append(_tg_field("📈 Deposit into Steam", f"{percent:+.1f}% net"))
                     else:
-                        lines.append(_tg_field("Deposit into Steam", "n/a (currency mismatch)"))
+                        lines.append(_tg_field("📈 Deposit into Steam", "n/a (currency mismatch)"))
                 else:
-                    lines.append(_tg_field("Bought on CSFloat", matched.get("sale_price")))
+                    lines.append(_tg_field("🛍️ Bought on CSFloat", matched.get("sale_price")))
                 update = {
                     "steam_sale_reported_at": now.isoformat(timespec="seconds"),
                     "steam_sale_net": net,
                     "steam_sale_currency": net_currency,
                 }
             else:
-                lines.append(_tg_field("Bought on CSFloat", "not found in purchase log"))
+                lines.append(_tg_field("🛍️ Bought on CSFloat", "not found in purchase log"))
             await send_telegram_notification("\n".join(lines), parse_mode="HTML")
             if update and matched:
                 matched.update(update)
@@ -1664,11 +1664,11 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 sent_offer_id = int(offer_id)
                 logger.info(f"Trade {trade_id}: отправка подтверждена для '{item_name}' за {sale_price}.")
                 message_lines = [
-                    "<b>CSFloat sale sent</b>",
+                    "💸 <b>CSFloat sale sent</b>",
                     "",
-                    _tg_field("Trade", trade_id, mono=True),
-                    _tg_field("Item", item_name),
-                    _tg_field("Price", sale_price),
+                    _tg_field("🔗 Trade", trade_id, mono=True),
+                    _tg_field("📦 Item", item_name),
+                    _tg_field("🏷️ Price", sale_price),
                 ]
                 details, finance_state = _steam_purchase_report_lines(sale_price, asset_id)
                 if details:
@@ -1754,7 +1754,7 @@ async def _startup_login(client) -> bool:
             logger.warning(f"Steam login failed ({failures}): {e}. Повтор через {int(delay)} сек.")
             if failures == 3:
                 await send_telegram_notification(
-                    "<b>Steam login failed 3 times</b>\n"
+                    "🚨 <b>Steam login failed 3 times</b>\n"
                     "Check credentials / cookies. Bot keeps retrying.",
                     parse_mode="HTML",
                 )
@@ -1797,7 +1797,7 @@ async def main():
 
     ensure_reporting_baseline()
 
-    await send_telegram_notification("<b>Auto-Trade bot started</b>", parse_mode="HTML")
+    await send_telegram_notification("🚀 <b>Auto-Trade bot started</b>", parse_mode="HTML")
 
     try:
         await sync_steam_finance(client)
