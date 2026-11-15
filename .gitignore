@@ -12,6 +12,7 @@ steam_rate_limit.json
 steam_auth_backoff.json
 steam_finance_state.json
 csfloat_auto_trade.log
+csfloat_auto_trade.log.*
 
 # Python
 __pycache__/
