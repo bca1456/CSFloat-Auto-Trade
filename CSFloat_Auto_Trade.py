@@ -1010,6 +1010,10 @@ async def send_period_report(kind, start, end, state, title_prefix=""):
         title = f"{title_prefix} {title}"
     aggregates = _aggregate_finance_period(state, start, end, currency)
     text = _format_period_report(title, start, end, aggregates, currency)
+    logger.info(
+        f"Sending {kind} report {start:%Y-%m-%d %H:%M} — {end:%Y-%m-%d %H:%M} "
+        f"(currency={currency})"
+    )
     return await send_telegram_notification(text, parse_mode="HTML")
 
 
@@ -1023,15 +1027,16 @@ async def maybe_send_scheduled_reports():
 
     initialized = False
     if last_weekly is None:
-        state["last_weekly_report_end"] = weekly_target.isoformat(timespec="seconds")
-        last_weekly = weekly_target
+        last_weekly = weekly_target - timedelta(days=7)
+        state["last_weekly_report_end"] = last_weekly.isoformat(timespec="seconds")
         initialized = True
     if last_monthly is None:
-        state["last_monthly_report_end"] = monthly_target.isoformat(timespec="seconds")
         last_monthly = monthly_target
+        state["last_monthly_report_end"] = last_monthly.isoformat(timespec="seconds")
         initialized = True
     if initialized:
         _save_steam_finance_state(state)
+        logger.info("Report baselines initialized; missed weekly report will be sent now.")
 
     weekly_due = weekly_target > last_weekly
     monthly_due = monthly_target > last_monthly
