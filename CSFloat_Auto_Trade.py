@@ -247,6 +247,7 @@ STEAM_FINANCE_STATE_MAX_PROCESSED = 5000
 STEAM_FINANCE_STATE_MAX_EVENT_KEYS = 20000
 STEAM_FINANCE_CACHE_VERSION = 2
 FINANCE_LEDGER_TTL_DAYS = 400
+FINANCE_LEDGER_BACKFILL_VERSION = 2
 
 # Периодические отчёты
 WEEKLY_REPORT_WEEKDAY = 6
@@ -779,25 +780,38 @@ def _append_finance_ledger(state, entry):
 def _record_withdrawal_ledger(state, trade_id, item_name, sale_price_text, asset_id, event_time=None):
     purchase = state.get("purchases", {}).get(str(asset_id)) if asset_id is not None else None
     amount, sale_currency = _parse_price_text(sale_price_text)
-    if not purchase or amount is None:
+    if amount is None:
         return
-    steam_paid = int(purchase.get("paid") or 0) / 100
-    if steam_paid <= 0:
-        return
-    steam_currency = (purchase.get("currency") or "USD").upper()
-    sale_currency = sale_currency or steam_currency
+
+    steam_paid = None
+    steam_currency = None
+    if isinstance(purchase, dict):
+        try:
+            steam_paid = int(purchase.get("paid") or 0) / 100
+        except (TypeError, ValueError):
+            steam_paid = None
+        steam_currency = (purchase.get("currency") or "USD").upper()
+
+    sale_currency = (
+        sale_currency
+        or steam_currency
+        or (state.get("wallet_currency") or "").upper()
+        or "USD"
+    )
     net = amount * (1 - CSFLOAT_SELL_FEE_PERCENT / 100)
     when = event_time or datetime.now()
-    _append_finance_ledger(state, {
+    entry = {
         "type": "withdrawal",
         "reference": str(trade_id),
         "time": when.isoformat(timespec="seconds"),
         "item_name": item_name,
         "amount": round(net, 4),
         "currency": sale_currency,
-        "cost": round(steam_paid, 4),
-        "cost_currency": steam_currency,
-    })
+    }
+    if steam_paid is not None and steam_paid > 0:
+        entry["cost"] = round(steam_paid, 4)
+        entry["cost_currency"] = steam_currency
+    _append_finance_ledger(state, entry)
 
 
 def _record_deposit_ledger(state, reference, item_name, net_amount, net_currency,
@@ -832,7 +846,10 @@ def _prune_finance_ledger(state, now=None):
 
 
 def _backfill_finance_ledger(state):
-    if state.get("ledger_backfilled"):
+    if (
+        state.get("ledger_backfilled")
+        and state.get("ledger_backfill_version", 0) >= FINANCE_LEDGER_BACKFILL_VERSION
+    ):
         return
     now = datetime.now()
 
@@ -883,6 +900,7 @@ def _backfill_finance_ledger(state):
         )
 
     state["ledger_backfilled"] = True
+    state["ledger_backfill_version"] = FINANCE_LEDGER_BACKFILL_VERSION
 
 
 def ensure_finance_ledger():
@@ -980,13 +998,17 @@ def _format_period_report(title, start, end, aggregates, currency):
     )
 
     def build_section(emoji, label, data):
-        sold = data["matched_amount"] if data["cost"] > 0 else data["amount"]
         lines = [f"{emoji} <b>{label}</b>"]
         if data["cost"] > 0:
             lines.append(f"Bought: {data['cost']:.2f} {currency}")
         else:
             lines.append("Bought: n/a")
-        lines.append(f"Sold: {sold:.2f} {currency}")
+        lines.append(f"Sold: {data['amount']:.2f} {currency}")
+        if data["cost"] > 0:
+            if data["matched"] < data["count"]:
+                lines.append(f"Matched sold: {data['matched_amount']:.2f} {currency}")
+            profit = data["matched_amount"] - data["cost"]
+            lines.append(f"Profit: {profit:+.2f} {currency}")
         if data["percent"] is not None:
             lines.append(f"Percent: {data['percent']:+.1f}%")
         else:
