@@ -11,6 +11,7 @@ buyer_purchases_log.json
 steam_rate_limit.json
 steam_auth_backoff.json
 steam_finance_state.json
+logs/
 csfloat_auto_trade.log
 csfloat_auto_trade.log.*
 

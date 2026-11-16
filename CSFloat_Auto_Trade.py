@@ -38,7 +38,8 @@ class SteamRateLimited(RuntimeError):
 # ЛОГИРОВАНИЕ И ХЕЛПЕРЫ
 # =============================================================================
 
-LOG_FILE = Path("csfloat_auto_trade.log")
+LOG_DIR = Path("logs")                             # папка для лог-файлов
+LOG_FILE = LOG_DIR / "csfloat_auto_trade.log"      # основной файл логов
 LOG_RETENTION_DAYS = 45
 
 _LOG_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -121,6 +122,7 @@ def prune_old_logs():
 def setup_logging():
     if logging.getLogger().handlers:
         return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
