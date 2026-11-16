@@ -225,69 +225,70 @@ apply_aiosteampy_patches()
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # =============================================================================
 
-CHECK_INTERVAL_MINUTES = 30
-CHECK_INTERVAL_JITTER_SEC = 60
-STEAM_API_MIN_INTERVAL_SEC = 3
-STEAM_RATE_LIMIT_BACKOFF_SEC = 15 * 60
-SELLER_SYNC_INTERVAL_SEC = 6 * 60 * 60
-SELLER_SYNC_BATCH_SIZE = 5
-SELLER_SYNC_TRANSIENT_RETRY_SEC = 15 * 60      # повтор проверки pending при транзиентной ошибке
-SELLER_SYNC_ERROR_RETRY_SEC = 12 * 60 * 60     # повтор при постоянной (нетранзиентной) ошибке
-PROCESSED_TRADES_TTL_DAYS = 30                 # сколько хранить обработанные трейды
-CSFLOAT_SELL_FEE_PERCENT = 2.0                 # комиссия CSFloat при продаже
+CHECK_INTERVAL_MINUTES = 30                     # интервал проверки трейдов, мин
+CHECK_INTERVAL_JITTER_SEC = 60                  # случайный разброс интервала, сек
+STEAM_API_MIN_INTERVAL_SEC = 3                  # минимальная пауза между запросами к Steam, сек
+STEAM_RATE_LIMIT_BACKOFF_SEC = 15 * 60          # пауза после лимита Steam (429), сек
+SELLER_SYNC_INTERVAL_SEC = 6 * 60 * 60          # интервал синхронизации статусов продавца, сек
+SELLER_SYNC_BATCH_SIZE = 5                      # сколько pending-трейдов проверять за раз
+SELLER_SYNC_TRANSIENT_RETRY_SEC = 15 * 60       # повтор проверки pending при транзиентной ошибке
+SELLER_SYNC_ERROR_RETRY_SEC = 12 * 60 * 60      # повтор при постоянной (нетранзиентной) ошибке
+PROCESSED_TRADES_TTL_DAYS = 30                  # сколько хранить обработанные трейды
+CSFLOAT_SELL_FEE_PERCENT = 2.0                  # комиссия CSFloat при продаже, %
 
 # Статистика по Steam: проверка баланса и истории рынка раз в N циклов
-STEAM_FINANCE_SYNC_EVERY_N_CYCLES = 5
-STEAM_MARKET_HISTORY_PAGE_SIZE = 100
-STEAM_MARKET_HISTORY_INITIAL_MAX_PAGES = 30
-STEAM_MARKET_HISTORY_INCREMENTAL_MAX_PAGES = 5
-STEAM_HISTORY_LOOKBACK_DAYS = 365
-STEAM_SALE_REPORT_WINDOW_DAYS = 14
-STEAM_FINANCE_STATE_MAX_PROCESSED = 5000
-STEAM_FINANCE_STATE_MAX_EVENT_KEYS = 20000
-STEAM_FINANCE_CACHE_VERSION = 2
-FINANCE_LEDGER_TTL_DAYS = 400
-FINANCE_LEDGER_BACKFILL_VERSION = 2
+STEAM_FINANCE_SYNC_EVERY_N_CYCLES = 5           # синхронизация финансов раз в N циклов
+STEAM_MARKET_HISTORY_PAGE_SIZE = 100            # размер страницы истории Steam-маркета
+STEAM_MARKET_HISTORY_INITIAL_MAX_PAGES = 30     # страниц истории при первой синхронизации
+STEAM_MARKET_HISTORY_INCREMENTAL_MAX_PAGES = 5  # страниц истории при обычной синхронизации
+STEAM_HISTORY_LOOKBACK_DAYS = 365               # глубина истории Steam-маркета, дней
+STEAM_SALE_REPORT_WINDOW_DAYS = 14              # окно отчётов о продажах Steam, дней
+STEAM_FINANCE_STATE_MAX_PROCESSED = 5000        # сколько обработанных продаж хранить
+STEAM_FINANCE_STATE_MAX_EVENT_KEYS = 20000      # сколько ключей событий истории хранить
+STEAM_FINANCE_CACHE_VERSION = 2                 # версия кэша финансового состояния
+FINANCE_LEDGER_TTL_DAYS = 400                   # срок хранения записей ledger, дней
+FINANCE_LEDGER_BACKFILL_VERSION = 2             # версия миграции/дозаполнения ledger
 
 # Периодические отчёты
-WEEKLY_REPORT_WEEKDAY = 6
-MONTHLY_REPORT_DAY = 30
-MONTHLY_REPORT_FEB_DAY = 28
-REPORT_HOUR = 18
+WEEKLY_REPORT_WEEKDAY = 6                       # день недели недельного отчёта (0=Пн)
+MONTHLY_REPORT_DAY = 30                         # день месяца месячного отчёта
+MONTHLY_REPORT_FEB_DAY = 28                     # день месячного отчёта в феврале
+REPORT_HOUR = 18                                # час отправки отчётов
 
-API_USER_INFO = "https://csfloat.com/api/v1/me"
-API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"
-API_ACCEPT_TRADE = "https://csfloat.com/api/v1/trades/{trade_id}/accept"
+API_USER_INFO = "https://csfloat.com/api/v1/me"  # профиль пользователя CSFloat
+API_TRADES = "https://csfloat.com/api/v1/me/trades?state=queued,pending&limit=500"  # активные трейды CSFloat
+API_ACCEPT_TRADE = "https://csfloat.com/api/v1/trades/{trade_id}/accept"  # принятие трейда CSFloat
 
-COOKIE_FILE = Path("cookies.json")
-PROCESSED_TRADES_FILE = Path("processed_trades.json")
-SELLER_PENDING_VERIFICATION_LOG_FILE = Path("seller_sent_pending_verification.json")
-BUYER_PURCHASES_LOG_FILE = Path("buyer_purchases_log.json")
-TG_CONFIG_FILE = Path("tg.json")
-STEAM_BACKOFF_FILE = Path("steam_rate_limit.json")
-STEAM_AUTH_BACKOFF_FILE = Path("steam_auth_backoff.json")
-STEAM_FINANCE_STATE_FILE = Path("steam_finance_state.json")
+COOKIE_FILE = Path("cookies.json")                                # cookies Steam-сессии
+PROCESSED_TRADES_FILE = Path("processed_trades.json")             # обработанные трейды
+SELLER_PENDING_VERIFICATION_LOG_FILE = Path("seller_sent_pending_verification.json")  # ожидающие подтверждения CSFloat
+BUYER_PURCHASES_LOG_FILE = Path("buyer_purchases_log.json")       # лог покупок на CSFloat
+TG_CONFIG_FILE = Path("tg.json")                                  # настройки Telegram
+STEAM_BACKOFF_FILE = Path("steam_rate_limit.json")                # пауза из-за лимита Steam
+STEAM_AUTH_BACKOFF_FILE = Path("steam_auth_backoff.json")         # пауза после ошибок авторизации
+STEAM_FINANCE_STATE_FILE = Path("steam_finance_state.json")       # финансовое состояние Steam
 
+# User-Agent для запросов к Steam/CSFloat
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
 )
 
 # Настройки отправки Steam-офферов
-STEAM_SEND_COOLDOWN_SEC = 15          # пауза между созданием офферов
-MAX_STEAM_SENDS_PER_PASS = 15          # макс. офферов за один проход
-STEAM_MOBILECONF_MIN_INTERVAL_SEC = 15 # минимальный интервал между вызовами mobileconf/getlist
-SEND_TRADE_MAX_RETRIES = 2            # попыток при ошибке (1 попытка + 1 повтор)
-SEND_TRADE_RETRY_DELAY_SEC = 15       # пауза при 500
-CSFLOAT_429_RETRY_DELAY_SEC = 30      # пауза при 429 от CSFloat (если нет Retry-After)
+STEAM_SEND_COOLDOWN_SEC = 15           # пауза между созданием офферов, сек
+MAX_STEAM_SENDS_PER_PASS = 15          # максимум офферов за один проход
+STEAM_MOBILECONF_MIN_INTERVAL_SEC = 15 # минимальный интервал между mobileconf/getlist, сек
+SEND_TRADE_MAX_RETRIES = 2             # попыток отправки оффера
+SEND_TRADE_RETRY_DELAY_SEC = 15        # пауза перед повтором после 500, сек
+CSFLOAT_429_RETRY_DELAY_SEC = 30       # пауза после 429 CSFloat, сек
 
 # Порог ошибок 429, после которого пропускаем оставшиеся трейды
-MAX_429_ERRORS_PER_PASS = 2
+MAX_429_ERRORS_PER_PASS = 2            # сколько 429 допустимо за один проход
 
 # Авторизация Steam: при протухшей сессии бот перелогинивается,
 # а при повторных неудачах логина полностью останавливает Steam-действия.
-STEAM_AUTH_BACKOFF_SEC = 60 * 60   # пауза после серии неудачных релогинов
-MAX_STEAM_AUTH_FAILURES = 3        # сколько неудачных релогинов терпеть
+STEAM_AUTH_BACKOFF_SEC = 60 * 60       # пауза после серии неудачных релогинов, сек
+MAX_STEAM_AUTH_FAILURES = 3            # сколько неудачных релогинов терпеть
 
 _steam_api_lock = None
 _steam_last_api_call = 0.0
