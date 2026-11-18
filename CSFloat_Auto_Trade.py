@@ -287,6 +287,17 @@ CSFLOAT_429_RETRY_DELAY_SEC = 30       # пауза после 429 CSFloat, се
 # Порог ошибок 429, после которого пропускаем оставшиеся трейды
 MAX_429_ERRORS_PER_PASS = 2            # сколько 429 допустимо за один проход
 
+# Переотправка seller-офферов, которые Steam закрыл в терминальном статусе
+MAX_SELLER_RESEND_ATTEMPTS = 3         # максимум переотправок одного seller-трейда
+TERMINAL_STEAM_OFFER_STATUSES = {      # статусы оффера, при которых возможна переотправка
+    "DECLINED",
+    "CANCELED",
+    "EXPIRED",
+    "INVALID",
+    "INVALID_ITEMS",
+    "CANCELED_BY_SECONDARY_FACTOR",
+}
+
 # Авторизация Steam: при протухшей сессии бот перелогинивается,
 # а при повторных неудачах логина полностью останавливает Steam-действия.
 STEAM_AUTH_BACKOFF_SEC = 60 * 60       # пауза после серии неудачных релогинов, сек
@@ -1676,9 +1687,14 @@ async def refresh_all_seller_pending_verification_from_steam(client: SteamClient
         if not isinstance(entry, dict) or not entry.get("trade_id"):
             continue
         try:
-            await seller_pending_should_hold_without_resend(
+            should_hold = await seller_pending_should_hold_without_resend(
                 client, _synthetic_trade_from_pending_entry(entry), entry, cache
             )
+            if not should_hold:
+                logger.info(
+                    f"seller_sent_pending_verification {entry.get('trade_id')}: "
+                    "Steam offer finalized; resend will be attempted on the next pass"
+                )
         except Exception as e:
             logger.warning(f"seller_sent_pending_verification sync deferred for {entry.get('trade_id')}: {e}")
             upsert_seller_pending_verification({
@@ -1764,7 +1780,20 @@ async def seller_pending_should_hold_without_resend(client: SteamClient, trade: 
             logger.warning(f"Withdrawal report failed for trade {trade_id}: {e}")
         return True
     if st in (TradeOfferStatus.DECLINED, TradeOfferStatus.CANCELED, TradeOfferStatus.EXPIRED, TradeOfferStatus.INVALID, TradeOfferStatus.INVALID_ITEMS, TradeOfferStatus.CANCELED_BY_SECONDARY_FACTOR):
+        was_terminal = entry.get("steam_offer_status") == st.name
         upsert_seller_pending_verification({**base_update, "steam_offer_id": None, "steam_offer_status": st.name, "note": f"Завершён: {st.name}"})
+        if not was_terminal:
+            logger.warning(f"Trade {trade_id}: Steam offer {steam_oid} closed with {st.name}; will retry while trade is active")
+            message_lines = [
+                "⚠️ <b>Seller Steam offer closed</b>",
+                "",
+                _tg_field("🔗 Trade", trade_id, mono=True),
+                _tg_field("📦 Item", item_name),
+                _tg_field("🏷️ Price", sale_price),
+                _tg_field("🛒 Steam offer", steam_oid, mono=True),
+                _tg_field("📄 Status", st.name),
+            ]
+            await send_telegram_notification("\n".join(message_lines), parse_mode="HTML")
         return False
     upsert_seller_pending_verification({**base_update, "steam_offer_id": steam_oid, "steam_offer_status": st.name, "note": f"Статус: {st.name}"})
     return True
@@ -2179,10 +2208,29 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
             continue
 
         pending_entry = seller_pending_by_id.get(str(trade_id))
+        resend_attempts = 0
         if pending_entry and my_steam_id64 == sid and my_steam_id64 != bid:
-            _mark_processed(processed_trades, trade_id)
-            stats["seller_waiting_verified"] += 1
-            continue
+            pending_status = str(pending_entry.get("steam_offer_status") or "")
+            offer_alive = bool(pending_entry.get("steam_offer_id")) and pending_status not in TERMINAL_STEAM_OFFER_STATUSES
+            if offer_alive:
+                _mark_processed(processed_trades, trade_id)
+                stats["seller_waiting_verified"] += 1
+                continue
+            resend_attempts = int(pending_entry.get("resend_attempts") or 0)
+            if resend_attempts >= MAX_SELLER_RESEND_ATTEMPTS:
+                logger.warning(
+                    f"Trade {trade_id}: Steam offer {pending_entry.get('steam_offer_id')} "
+                    f"is {pending_status or 'unknown'}; resend limit reached"
+                )
+                _mark_processed(processed_trades, trade_id)
+                stats["seller_waiting_verified"] += 1
+                continue
+            resend_attempts += 1
+            logger.warning(
+                f"Trade {trade_id}: Steam offer {pending_entry.get('steam_offer_id')} "
+                f"is {pending_status or 'unknown'}; resending ({resend_attempts}/{MAX_SELLER_RESEND_ATTEMPTS})"
+            )
+            processed_trades.pop(str(trade_id), None)
 
         if str(trade_id) in processed_trades:
             if my_steam_id64 == bid and my_steam_id64 != sid:
@@ -2244,6 +2292,7 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 "steam_offer_status": existing_offer_status.name,
                 "last_checked_at": datetime.now().isoformat(timespec="seconds"),
                 "sent_at": datetime.now().isoformat(timespec="seconds"),
+                "resend_attempts": resend_attempts,
                 "note": "Оффер уже отправлялся ранее; ждём verified на CSFloat",
             })
         else:
@@ -2307,10 +2356,18 @@ async def check_actionable_trades(session, csfloat_api_key, client: SteamGuardMi
                 "sent_at": datetime.now().isoformat(timespec="seconds"),
                 "csfloat_state": trade_state or "unknown",
                 "steam_offer_status": "CONFIRMATION_NEED",
+                "resend_attempts": resend_attempts,
+                "last_checked_at": datetime.now().isoformat(timespec="seconds"),
                 "note": "Оффер создан, требуется подтверждение через ASF",
             })
         else:
             logger.warning(f"Trade {trade_id} не помечен как обработанный — повторная попытка при следующей проверке.")
+            if resend_attempts:
+                upsert_seller_pending_verification({
+                    "trade_id": str(trade_id),
+                    "resend_attempts": resend_attempts,
+                    "last_checked_at": datetime.now().isoformat(timespec="seconds"),
+                })
             stats["failed"] += 1
 
     pending_all = load_seller_pending_verification_log()
